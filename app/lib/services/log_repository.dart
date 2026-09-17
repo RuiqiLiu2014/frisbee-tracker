@@ -12,7 +12,7 @@ import '../models/throw_log.dart';
 /// writes the app documents `logs/` directory. Binary `.bin` files survive
 /// restart; CSV/zip is produced on demand for the system share sheet.
 class LogRepository {
-  static const int _formatVersion = 1;
+  static const int _formatVersion = 2; // v2 added the separate throwClass field
 
   Future<Directory> _logsDir() async {
     final base = await getApplicationDocumentsDirectory();
@@ -32,6 +32,7 @@ class LogRepository {
       final dir = await _logsDir();
       final n = log.count;
       final nameBytes = utf8.encode(log.name);
+      final classBytes = utf8.encode(log.throwClass);
       final bd = ByteData(
         4 + // format version
             4 + // throwId
@@ -42,6 +43,8 @@ class LogRepository {
             8 + // peakGyroDps
             4 + // name length
             nameBytes.length +
+            4 + // class length
+            classBytes.length +
             n * 8 + // t (float64)
             6 * n * 4, // axes (float32)
       );
@@ -65,6 +68,10 @@ class LogRepository {
       final u8 = bd.buffer.asUint8List();
       u8.setRange(off, off + nameBytes.length, nameBytes);
       off += nameBytes.length;
+      bd.setInt32(off, classBytes.length, Endian.little);
+      off += 4;
+      u8.setRange(off, off + classBytes.length, classBytes);
+      off += classBytes.length;
       for (int i = 0; i < n; i++) {
         bd.setFloat64(off, log.t[i], Endian.little);
         off += 8;
@@ -118,7 +125,7 @@ class LogRepository {
     if (bytes.length < 8) return null;
     final version = bd.getInt32(off, Endian.little);
     off += 4;
-    if (version != _formatVersion) return null;
+    if (version != 1 && version != 2) return null;
     final throwId = bd.getInt32(off, Endian.little);
     off += 4;
     final n = bd.getInt32(off, Endian.little);
@@ -132,17 +139,32 @@ class LogRepository {
     off += 8;
     final peakGyroDps = bd.getFloat64(off, Endian.little);
     off += 8;
+    if (bytes.length < off + 4) return null;
     final nameLen = bd.getInt32(off, Endian.little);
     off += 4;
-    if (nameLen < 0 ||
-        bytes.length < off + nameLen + n * 8 + 6 * n * 4) {
-      return null;
+    if (nameLen < 0 || bytes.length < off + nameLen) return null;
+    String name = nameLen > 0
+        ? utf8.decode(bytes.sublist(off, off + nameLen))
+        : "";
+    off += nameLen;
+    // Throw class: read it (v2+), or migrate a v1 file. v1 stored the throw
+    // label in `name`; per the reset we treat every existing throw as backhand
+    // and clear the name so class and free-form name are cleanly separated.
+    String throwClass;
+    if (version >= 2) {
+      if (bytes.length < off + 4) return null;
+      final classLen = bd.getInt32(off, Endian.little);
+      off += 4;
+      if (classLen < 0 || bytes.length < off + classLen) return null;
+      throwClass = classLen > 0
+          ? utf8.decode(bytes.sublist(off, off + classLen))
+          : "unlabeled";
+      off += classLen;
+    } else {
+      throwClass = "backhand";
+      name = "";
     }
-    String name = "";
-    if (nameLen > 0) {
-      name = utf8.decode(bytes.sublist(off, off + nameLen));
-      off += nameLen;
-    }
+    if (bytes.length < off + n * 8 + 6 * n * 4) return null;
     final t = Float64List(n);
     for (int i = 0; i < n; i++) {
       t[i] = bd.getFloat64(off, Endian.little);
@@ -169,6 +191,7 @@ class LogRepository {
       peakAccelG: peakAccelG,
       peakGyroDps: peakGyroDps,
       name: name,
+      throwClass: throwClass,
     );
   }
 
@@ -199,7 +222,8 @@ class LogRepository {
   String csvFor(ThrowLog log) {
     final sb = StringBuffer()
       ..write(
-        "# throw_id=${log.throwId},label=${log.name},samples=${log.count},"
+        "# throw_id=${log.throwId},class=${log.throwClass},name=${log.name},"
+        "samples=${log.count},"
         "sample_rate_hz=${log.sampleRateHz.toStringAsFixed(1)},"
         "dropped=${log.droppedSamples},"
         "peak_accel_g=${log.peakAccelG.toStringAsFixed(4)},"

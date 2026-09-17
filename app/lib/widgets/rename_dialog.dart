@@ -52,6 +52,14 @@ class _RenameDialogState extends State<RenameDialog> {
         focusNode: _focusNode,
         autofocus: true,
         textInputAction: TextInputAction.done,
+        // Gboard can close/crash the instant a Flutter TextField gains focus when
+        // its suggestion / autocorrect / personalized-learning features engage
+        // (flutter/flutter#80709). Disabling them is the standard workaround and
+        // is harmless for short throw names.
+        keyboardType: TextInputType.text,
+        enableSuggestions: false,
+        autocorrect: false,
+        enableIMEPersonalizedLearning: false,
         decoration: InputDecoration(
           hintText: widget.hint,
           hintStyle: TextStyle(color: Colors.grey.shade400),

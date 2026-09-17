@@ -14,7 +14,8 @@ class ThrowLog {
   final int droppedSamples; // samples lost to BLE drops during upload
   final double peakAccelG;
   final double peakGyroDps;
-  String name; // user label; empty => display falls back to "Throw #id"
+  String name; // free-form user name; empty => display falls back to "Throw #id"
+  String throwClass; // throw type, one of kThrowLabels (e.g. "backhand", "unlabeled")
 
   ThrowLog({
     required this.id,
@@ -29,6 +30,7 @@ class ThrowLog {
     this.peakAccelG = 0,
     this.peakGyroDps = 0,
     this.name = "",
+    this.throwClass = "unlabeled",
   });
 
   String get displayName => name.isEmpty ? "Throw #$id" : name;

@@ -87,7 +87,8 @@ class _HomeShellState extends State<HomeShell>
       droppedSamples: r.droppedSamples,
       peakAccelG: r.peakAccelG,
       peakGyroDps: r.peakGyroDps,
-      name: r.label == "unlabeled" ? "" : r.label,
+      name: "",
+      throwClass: r.label,
     );
     await _repo.persist(log);
     if (!mounted) return;
@@ -112,6 +113,23 @@ class _HomeShellState extends State<HomeShell>
     _refreshStorage();
   }
 
+  /// Ensure [desired] is unique among the *other* logs by appending " (1)",
+  /// " (2)", ... to the newest / just-renamed one when it collides. Blank names
+  /// are left as-is (they display as "Throw #id", already unique). [excludeId]
+  /// skips the log being renamed so it never clashes with itself.
+  String _uniqueName(String desired, {int? excludeId}) {
+    final base = desired.trim();
+    if (base.isEmpty) return base;
+    bool taken(String candidate) =>
+        _logs.any((l) => l.id != excludeId && l.name == candidate);
+    if (!taken(base)) return base;
+    int n = 1;
+    while (taken('$base ($n)')) {
+      n++;
+    }
+    return '$base ($n)';
+  }
+
   Future<void> _renameLog(ThrowLog log) async {
     final result = await showDialog<String>(
       context: context,
@@ -119,7 +137,7 @@ class _HomeShellState extends State<HomeShell>
           RenameDialog(initial: log.name, hint: "Throw #${log.id}"),
     );
     if (result == null) return;
-    log.name = result.trim();
+    log.name = _uniqueName(result, excludeId: log.id);
     await _repo.persist(log);
     if (mounted) setState(() {});
   }
@@ -212,7 +230,7 @@ class _HomeShellState extends State<HomeShell>
     // Middle readouts reflect the most recent throw. When disconnected they gray
     // out and zero, rather than disappearing, so the layout stays stable.
     final String typeText =
-        (active && last != null && last.name.isNotEmpty) ? last.name : "—";
+        (active && last != null) ? last.throwClass : "—";
     final String spinText = (active && last != null)
         ? "${(last.peakGyroDps / 360).toStringAsFixed(1)} rev/s"
         : "0 rev/s";
@@ -496,12 +514,17 @@ class _HomeShellState extends State<HomeShell>
     return ListTile(
       title: Text(log.displayName),
       subtitle: Text(
-        "${log.count} samples · ${log.durationSec.toStringAsFixed(2)} s · "
+        "${log.throwClass} · ${log.count} samples · "
+        "${log.durationSec.toStringAsFixed(2)} s · "
         "${log.sampleRateHz.toStringAsFixed(0)} Hz"
         "${log.droppedSamples > 0 ? " · ${log.droppedSamples} dropped" : ""}",
       ),
       trailing: PopupMenuButton<String>(
         onSelected: (v) {
+          if (v.startsWith('class:')) {
+            _setLogClass(log, v.substring(6));
+            return;
+          }
           switch (v) {
             case 'rename':
               _renameLog(log);
@@ -514,14 +537,28 @@ class _HomeShellState extends State<HomeShell>
               break;
           }
         },
-        itemBuilder: (_) => const [
-          PopupMenuItem(value: 'rename', child: Text("Rename")),
-          PopupMenuItem(value: 'export', child: Text("Export")),
-          PopupMenuItem(value: 'delete', child: Text("Delete")),
+        itemBuilder: (_) => [
+          // Class picker, kept in sync with the connection screen via kThrowLabels.
+          for (final c in kThrowLabels)
+            CheckedPopupMenuItem(
+              value: 'class:$c',
+              checked: log.throwClass == c,
+              child: Text(c),
+            ),
+          const PopupMenuDivider(),
+          const PopupMenuItem(value: 'rename', child: Text("Rename")),
+          const PopupMenuItem(value: 'export', child: Text("Export")),
+          const PopupMenuItem(value: 'delete', child: Text("Delete")),
         ],
       ),
       onTap: () => setState(() => _openLog = log),
     );
+  }
+
+  Future<void> _setLogClass(ThrowLog log, String cls) async {
+    log.throwClass = cls;
+    await _repo.persist(log);
+    if (mounted) setState(() {});
   }
 
   Widget _buildDetail(ThrowLog log) {
@@ -610,7 +647,8 @@ class _HomeShellState extends State<HomeShell>
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            row("Label", log.name.isEmpty ? "(none)" : log.name),
+            row("Class", log.throwClass),
+            row("Name", log.name.isEmpty ? "(none)" : log.name),
             row("Samples", "${log.count}"),
             row("Duration", "${log.durationSec.toStringAsFixed(3)} s"),
             row("Sample rate", "${log.sampleRateHz.toStringAsFixed(0)} Hz"),
