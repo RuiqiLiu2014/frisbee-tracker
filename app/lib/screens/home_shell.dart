@@ -10,6 +10,7 @@ import '../models/throw_log.dart';
 import '../services/frisbee_ble.dart';
 import '../services/log_repository.dart';
 import '../settings.dart';
+import '../widgets/calibration_dialog.dart';
 import '../widgets/interactive_chart.dart';
 import '../widgets/rename_dialog.dart';
 import 'settings_tab.dart';
@@ -31,6 +32,9 @@ class _HomeShellState extends State<HomeShell>
   final List<ThrowLog> _logs = [];
   int _logSeq = 0;
   int _storageBytes = 0;
+  String? _calibStatus; // null until we know; e.g. "Calibrated"
+  List<double>? _calibFull; // current calibration [ax,ay,az,gxB,gyB,gzB], if any
+  List<double>? _calibDown; // its gravity/"down" vector [ax,ay,az] (for live tilt)
   ThrowLog? _openLog; // non-null => Logs tab shows the detail view
   late final TabController _tab;
   StreamSubscription<ReceivedThrow>? _throwSub;
@@ -42,6 +46,58 @@ class _HomeShellState extends State<HomeShell>
     _ble.addListener(_onBleChanged);
     _throwSub = _ble.throws.listen(_onThrowReceived);
     _loadLogs();
+    _loadCalibStatus();
+    _loadLabel();
+  }
+
+  Future<void> _loadCalibStatus() async {
+    final prefs = await SharedPreferences.getInstance();
+    final s = prefs.getString(kCalibKey);
+    List<double>? full;
+    if (s != null) {
+      final p = s.split(',').map(double.tryParse).toList();
+      if (p.length >= 6 && !p.sublist(0, 6).contains(null)) {
+        full = p.sublist(0, 6).cast<double>();
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _calibStatus = s != null ? "Calibrated" : "Not calibrated";
+      _calibFull = full;
+      _calibDown = full?.sublist(0, 3);
+    });
+  }
+
+  Future<void> _loadLabel() async {
+    final prefs = await SharedPreferences.getInstance();
+    final l = prefs.getString(kLabelKey);
+    if (l != null && kThrowLabels.contains(l)) _ble.sendLabel(l);
+  }
+
+  void _selectLabel(String l) {
+    _ble.sendLabel(l);
+    SharedPreferences.getInstance().then((p) => p.setString(kLabelKey, l));
+  }
+
+  // Tilt of the current accel vector from the calibrated "flat" reference (or
+  // the sensor z-axis if not yet calibrated), in degrees.
+  double _tiltDeg(double ax, double ay, double az) {
+    final ref = _calibDown ?? const [0.0, 0.0, 1.0];
+    final dot = ax * ref[0] + ay * ref[1] + az * ref[2];
+    final ma = math.sqrt(ax * ax + ay * ay + az * az);
+    final mr = math.sqrt(ref[0] * ref[0] + ref[1] * ref[1] + ref[2] * ref[2]);
+    if (ma == 0 || mr == 0) return 0;
+    final c = (dot / (ma * mr)).clamp(-1.0, 1.0);
+    return 57.2958 * math.acos(c);
+  }
+
+  Future<void> _openCalibration() async {
+    await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => CalibrationDialog(ble: _ble),
+    );
+    _loadCalibStatus();
   }
 
   @override
@@ -89,6 +145,7 @@ class _HomeShellState extends State<HomeShell>
       peakGyroDps: r.peakGyroDps,
       name: "",
       throwClass: r.label,
+      calib: _calibFull, // bake in the calibration that was active at capture
     );
     await _repo.persist(log);
     if (!mounted) return;
@@ -227,23 +284,40 @@ class _HomeShellState extends State<HomeShell>
     final scheme = Theme.of(context).colorScheme;
     final Color dim = Theme.of(context).disabledColor;
 
-    // Middle readouts reflect the most recent throw. When disconnected they gray
-    // out and zero, rather than disappearing, so the layout stays stable.
-    final String typeText =
-        (active && last != null) ? last.throwClass : "—";
-    final String spinText = (active && last != null)
+    // Last-throw readouts reflect the most recent stored throw and stay shown
+    // whether or not we're connected (it's historical data), graying only when
+    // there are no throws yet.
+    final String typeText = last != null ? last.throwClass : "—";
+    final String spinText = last != null
         ? "${(last.peakGyroDps / 360).toStringAsFixed(1)} rev/s"
         : "0 rev/s";
-    final String accelText = (active && last != null)
+    final String accelText = last != null
         ? "${last.peakAccelG.toStringAsFixed(1)} g"
         : "0 g";
-    final String flightText = (active && last != null)
+    final String flightText = last != null
         ? "${last.durationSec.toStringAsFixed(2)} s"
         : "0 s";
-    final String sampleText = (active && last != null)
+    final String sampleText = last != null
         ? "${last.count}"
               "${last.droppedSamples > 0 ? " (${last.droppedSamples} dropped)" : ""}"
         : "0";
+
+    // Live readouts (current tilt + accel magnitude) come from the ~20 Hz idle
+    // stream and gray out when disconnected / before the first packet arrives.
+    final bool haveLive = _ble.hasLive;
+    final double liveAccelG = haveLive
+        ? math.sqrt(
+            _ble.liveAx! * _ble.liveAx! +
+                _ble.liveAy! * _ble.liveAy! +
+                _ble.liveAz! * _ble.liveAz!,
+          )
+        : 0;
+    final String liveAccelText = haveLive
+        ? "${liveAccelG.toStringAsFixed(2)} g"
+        : "—";
+    final String liveTiltText = haveLive
+        ? "${_tiltDeg(_ble.liveAx!, _ble.liveAy!, _ble.liveAz!).toStringAsFixed(0)}°"
+        : "—";
 
     return Column(
       children: [
@@ -293,31 +367,42 @@ class _HomeShellState extends State<HomeShell>
                     ),
                   ],
                 ),
-                const SizedBox(height: 24),
-                _readout("Last throw type", typeText, active),
+                const SizedBox(height: 16),
+                // Live (current) — updates ~20 Hz while connected.
+                Row(
+                  children: [
+                    Expanded(child: _readout("Tilt", liveTiltText, connected)),
+                    Expanded(child: _readout("Accel", liveAccelText, connected)),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                _readout("Last throw type", typeText, last != null),
                 const SizedBox(height: 18),
                 Row(
                   children: [
-                    Expanded(child: _readout("Peak spin", spinText, active)),
-                    Expanded(child: _readout("Peak accel", accelText, active)),
+                    Expanded(
+                      child: _readout("Peak spin", spinText, last != null),
+                    ),
+                    Expanded(
+                      child: _readout("Peak accel", accelText, last != null),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 18),
                 Row(
                   children: [
                     Expanded(
-                      child: _readout("Flight time", flightText, active),
+                      child: _readout("Flight time", flightText, last != null),
                     ),
-                    Expanded(child: _readout("Samples", sampleText, active)),
+                    Expanded(
+                      child: _readout("Samples", sampleText, last != null),
+                    ),
                   ],
                 ),
-                const SizedBox(height: 20),
-                Text(
+                const SizedBox(height: 16),
+                const Text(
                   "Label (next throw)",
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: active ? null : dim,
-                  ),
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 8),
                 Wrap(
@@ -327,8 +412,8 @@ class _HomeShellState extends State<HomeShell>
                     for (final l in kThrowLabels)
                       ChoiceChip(
                         label: Text(l),
-                        selected: active && _ble.label == l,
-                        onSelected: active ? (_) => _ble.sendLabel(l) : null,
+                        selected: _ble.label == l,
+                        onSelected: (_) => _selectLabel(l),
                       ),
                   ],
                 ),
@@ -347,22 +432,23 @@ class _HomeShellState extends State<HomeShell>
             mainAxisSize: MainAxisSize.min,
             children: [
               OutlinedButton.icon(
-                // No-op for now — there will be one pose (disc flat on the
-                // floor). The calibration wizard is on the TODO.
-                onPressed: connected
-                    ? () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text(
-                              "Calibration coming soon (disc flat on the floor).",
-                            ),
-                          ),
-                        );
-                      }
-                    : null,
+                // Single-pose calibration (disc flat on the floor). Opens the
+                // wizard, which asks the disc for a one-shot still reading.
+                onPressed: connected ? _openCalibration : null,
                 icon: const Icon(Icons.explore),
                 label: const Text("Calibrate"),
               ),
+              if (_calibStatus != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    _calibStatus!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
               const SizedBox(height: 8),
               ElevatedButton(
                 onPressed: connecting

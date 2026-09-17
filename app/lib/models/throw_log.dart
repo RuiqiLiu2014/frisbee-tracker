@@ -16,6 +16,10 @@ class ThrowLog {
   final double peakGyroDps;
   String name; // free-form user name; empty => display falls back to "Throw #id"
   String throwClass; // throw type, one of kThrowLabels (e.g. "backhand", "unlabeled")
+  // Calibration snapshot baked in at capture time so a throw's orientation never
+  // shifts when the disc is re-calibrated later: [ax, ay, az, gxBias, gyBias,
+  // gzBias] (g, dps), or null if the disc wasn't calibrated when it was thrown.
+  final List<double>? calib;
 
   ThrowLog({
     required this.id,
@@ -31,6 +35,7 @@ class ThrowLog {
     this.peakGyroDps = 0,
     this.name = "",
     this.throwClass = "unlabeled",
+    this.calib,
   });
 
   String get displayName => name.isEmpty ? "Throw #$id" : name;

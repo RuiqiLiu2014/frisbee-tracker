@@ -40,6 +40,8 @@ const int _pktBegin = 0x01;
 const int _pktSamples = 0x02;
 const int _pktEnd = 0x03;
 const int _pktStatus = 0x10;
+const int _pktCalib = 0x11;
+const int _pktLive = 0x12;
 
 const int _kMaxThrowSamples = 60000; // ~36 s at 1660 Hz; sanity clamp
 
@@ -73,6 +75,26 @@ class ReceivedThrow {
   });
 }
 
+/// A one-shot calibration reading taken with the disc flat + still: the mean
+/// accelerometer vector (gravity / "down" in the sensor frame) and the mean
+/// gyro reading (the zero-rate bias to subtract later).
+class CalibResult {
+  final double ax, ay, az; // g
+  final double gxBias, gyBias, gzBias; // dps
+  const CalibResult({
+    required this.ax,
+    required this.ay,
+    required this.az,
+    required this.gxBias,
+    required this.gyBias,
+    required this.gzBias,
+  });
+
+  double get accelMag => math.sqrt(ax * ax + ay * ay + az * az);
+  double get gyroBiasMag =>
+      math.sqrt(gxBias * gxBias + gyBias * gyBias + gzBias * gzBias);
+}
+
 /// Owns the BLE link and the store-and-forward receiver. A [ChangeNotifier] so
 /// the UI can rebuild on connection/upload state changes; completed throws are
 /// emitted on the [throws] stream.
@@ -84,6 +106,8 @@ class FrisbeeBle extends ChangeNotifier {
   int _batteryPct = 0;
   int? _rssi;
   String _label = "unlabeled";
+  // Latest live accel (g), null until the first live packet / after disconnect.
+  double? _liveAx, _liveAy, _liveAz;
 
   // ---- current upload progress ----
   bool _receiving = false;
@@ -98,6 +122,10 @@ class FrisbeeBle extends ChangeNotifier {
   int get batteryPct => _batteryPct;
   int? get rssi => _rssi;
   String get label => _label;
+  double? get liveAx => _liveAx;
+  double? get liveAy => _liveAy;
+  double? get liveAz => _liveAz;
+  bool get hasLive => _liveAx != null;
   bool get receiving => _receiving;
   int get uploadExpected => _uploadExpected;
   int get uploadWritten => _uploadWritten;
@@ -116,6 +144,8 @@ class FrisbeeBle extends ChangeNotifier {
   StreamSubscription<BluetoothConnectionState>? _connSub;
   Timer? _scanTimeout;
   Timer? _rssiTimer;
+  Timer? _calibTimeout;
+  Completer<CalibResult>? _calibCompleter;
 
   // ---- in-flight throw assembly buffers ----
   List<Float32List>? _axBuf;
@@ -331,7 +361,22 @@ class FrisbeeBle extends ChangeNotifier {
       case _pktStatus:
         _onStatus(bd, bytes.length);
         break;
+      case _pktCalib:
+        _onCalib(bd, bytes.length);
+        break;
+      case _pktLive:
+        _onLive(bd, bytes.length);
+        break;
     }
+  }
+
+  void _onLive(ByteData bd, int len) {
+    if (len < 7) return;
+    _set(() {
+      _liveAx = bd.getInt16(1, Endian.little) * kAccelScaleG;
+      _liveAy = bd.getInt16(3, Endian.little) * kAccelScaleG;
+      _liveAz = bd.getInt16(5, Endian.little) * kAccelScaleG;
+    });
   }
 
   void _onBegin(ByteData bd, int len) {
@@ -440,6 +485,22 @@ class FrisbeeBle extends ChangeNotifier {
     _set(() => _batteryPct = pct);
   }
 
+  void _onCalib(ByteData bd, int len) {
+    if (len < 25) return;
+    final r = CalibResult(
+      ax: bd.getFloat32(1, Endian.little),
+      ay: bd.getFloat32(5, Endian.little),
+      az: bd.getFloat32(9, Endian.little),
+      gxBias: bd.getFloat32(13, Endian.little),
+      gyBias: bd.getFloat32(17, Endian.little),
+      gzBias: bd.getFloat32(21, Endian.little),
+    );
+    _calibTimeout?.cancel();
+    if (_calibCompleter != null && !_calibCompleter!.isCompleted) {
+      _calibCompleter!.complete(r);
+    }
+  }
+
   (double, double) _computePeaks(List<Float32List> axes, int count) {
     double pa = 0, pg = 0;
     for (int i = 0; i < count; i++) {
@@ -483,6 +544,30 @@ class FrisbeeBle extends ChangeNotifier {
 
   Future<void> clearDeviceQueue() => _write("CLEAR\n");
 
+  /// Ask the disc for a one-shot calibration reading (it averages a short still
+  /// window and replies). Completes with the reading, or errors on timeout /
+  /// disconnect. Caller should have the disc flat + still first.
+  Future<CalibResult> calibrate({
+    Duration timeout = const Duration(seconds: 6),
+  }) {
+    if (_state != ConnState.connected || _rxChar == null) {
+      return Future.error(StateError("Not connected"));
+    }
+    _calibTimeout?.cancel();
+    if (_calibCompleter != null && !_calibCompleter!.isCompleted) {
+      _calibCompleter!.completeError(StateError("superseded"));
+    }
+    final c = Completer<CalibResult>();
+    _calibCompleter = c;
+    _calibTimeout = Timer(timeout, () {
+      if (!c.isCompleted) {
+        c.completeError(TimeoutException("No calibration response"));
+      }
+    });
+    _write("CALIB\n");
+    return c.future;
+  }
+
   // =========================================================================
   // Teardown
   // =========================================================================
@@ -510,12 +595,17 @@ class FrisbeeBle extends ChangeNotifier {
 
   void _resetConnectionUi() {
     _resetAssembly();
+    _calibTimeout?.cancel();
+    if (_calibCompleter != null && !_calibCompleter!.isCompleted) {
+      _calibCompleter!.completeError(StateError("Disconnected"));
+    }
     _set(() {
       _state = ConnState.disconnected;
       _status = "Disconnected";
       _receiving = false;
       _rssi = null;
       _rxChar = null;
+      _liveAx = _liveAy = _liveAz = null;
     });
   }
 
@@ -574,6 +664,7 @@ class FrisbeeBle extends ChangeNotifier {
   void dispose() {
     _scanTimeout?.cancel();
     _rssiTimer?.cancel();
+    _calibTimeout?.cancel();
     _txSub?.cancel();
     _scanSub?.cancel();
     _connSub?.cancel();

@@ -12,7 +12,8 @@ import '../models/throw_log.dart';
 /// writes the app documents `logs/` directory. Binary `.bin` files survive
 /// restart; CSV/zip is produced on demand for the system share sheet.
 class LogRepository {
-  static const int _formatVersion = 2; // v2 added the separate throwClass field
+  // v2 added the separate throwClass field; v3 bakes in the per-throw calibration.
+  static const int _formatVersion = 3;
 
   Future<Directory> _logsDir() async {
     final base = await getApplicationDocumentsDirectory();
@@ -33,6 +34,9 @@ class LogRepository {
       final n = log.count;
       final nameBytes = utf8.encode(log.name);
       final classBytes = utf8.encode(log.throwClass);
+      final calib = (log.calib != null && log.calib!.length == 6)
+          ? log.calib!
+          : const <double>[];
       final bd = ByteData(
         4 + // format version
             4 + // throwId
@@ -45,6 +49,8 @@ class LogRepository {
             nameBytes.length +
             4 + // class length
             classBytes.length +
+            4 + // calib count (0 or 6)
+            calib.length * 8 + // calib values (float64)
             n * 8 + // t (float64)
             6 * n * 4, // axes (float32)
       );
@@ -72,6 +78,12 @@ class LogRepository {
       off += 4;
       u8.setRange(off, off + classBytes.length, classBytes);
       off += classBytes.length;
+      bd.setInt32(off, calib.length, Endian.little);
+      off += 4;
+      for (final c in calib) {
+        bd.setFloat64(off, c, Endian.little);
+        off += 8;
+      }
       for (int i = 0; i < n; i++) {
         bd.setFloat64(off, log.t[i], Endian.little);
         off += 8;
@@ -125,7 +137,7 @@ class LogRepository {
     if (bytes.length < 8) return null;
     final version = bd.getInt32(off, Endian.little);
     off += 4;
-    if (version != 1 && version != 2) return null;
+    if (version < 1 || version > 3) return null;
     final throwId = bd.getInt32(off, Endian.little);
     off += 4;
     final n = bd.getInt32(off, Endian.little);
@@ -164,6 +176,23 @@ class LogRepository {
       throwClass = "backhand";
       name = "";
     }
+    // Per-throw calibration (v3+); older logs simply have none.
+    List<double>? calib;
+    if (version >= 3) {
+      if (bytes.length < off + 4) return null;
+      final calibCount = bd.getInt32(off, Endian.little);
+      off += 4;
+      if (calibCount == 6) {
+        if (bytes.length < off + 48) return null;
+        calib = List<double>.generate(6, (_) {
+          final v = bd.getFloat64(off, Endian.little);
+          off += 8;
+          return v;
+        });
+      } else if (calibCount != 0) {
+        return null;
+      }
+    }
     if (bytes.length < off + n * 8 + 6 * n * 4) return null;
     final t = Float64List(n);
     for (int i = 0; i < n; i++) {
@@ -192,6 +221,7 @@ class LogRepository {
       peakGyroDps: peakGyroDps,
       name: name,
       throwClass: throwClass,
+      calib: calib,
     );
   }
 
