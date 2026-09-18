@@ -29,7 +29,8 @@ final Guid kVersionCharacteristicUuid = Guid(
 //   0x02 SAMPLES [u8 type][u16 firstIndex][u8 n] + n * (int16 ax,ay,az,gx,gy,gz)
 //   0x03 END     [u8 type][u32 throwId][u16 sampleCount]
 //                [f32 peakAccelG][f32 peakGyroDps][u32 flightMs]
-//   0x10 STATUS  [u8 type][u8 battPct][u16 battMv]        (idle heartbeat)
+//   0x10 STATUS  [u8 type][u8 battPct|chg<<7][u16 battMv][u8 queued][u8 flags]
+//                (idle heartbeat; batt bit7 = charging LED, flags bit0 = plugged)
 //
 // App -> device on the RX characteristic (ASCII, newline-terminated):
 //   "ACK:<throwId>\n"   confirm a throw was received (device may then dequeue)
@@ -48,6 +49,7 @@ const int _pktCalib = 0x11;
 const int _pktLive = 0x12;
 
 const int _kMaxThrowSamples = 60000; // ~36 s at 1660 Hz; sanity clamp
+const double _batteryAlpha = 0.02; // EMA weight for the battery % smoother
 
 enum ConnState { disconnected, scanning, connecting, connected }
 
@@ -111,6 +113,14 @@ class FrisbeeBle extends ChangeNotifier {
   int? _rssi;
   String _label = "unlabeled";
   int _preRollMs = kDefaultPreRollMs; // re-sent to the disc on every connect
+  // Battery: raw cell mV -> SoC on a LiPo curve, EMA-smoothed and clamped to
+  // never rise except while charging. Ported verbatim from the ping-pong app so
+  // both behave identically. _charging = plugged + charging (or topped off);
+  // _notCharging = plugged but not charging (on/off switch is off).
+  double _batterySmoothed = -1; // EMA of the raw % (-1 = no reading yet)
+  int _batteryShown = -1; // displayed %, monotonically non-increasing
+  bool _charging = false;
+  bool _notCharging = false;
   // Latest live accel (g), null until the first live packet / after disconnect.
   double? _liveAx, _liveAy, _liveAz;
 
@@ -125,6 +135,8 @@ class FrisbeeBle extends ChangeNotifier {
   String get status => _status;
   String get firmwareVersion => _firmwareVersion;
   int get batteryPct => _batteryPct;
+  bool get charging => _charging;
+  bool get notCharging => _notCharging;
   int? get rssi => _rssi;
   String get label => _label;
   int get preRollMs => _preRollMs;
@@ -499,10 +511,89 @@ class FrisbeeBle extends ChangeNotifier {
     });
   }
 
+  // Idle heartbeat: battery %, raw cell mV, and charge state. Ported from the
+  // ping-pong app: the raw mV maps to SoC on a LiPo curve, is EMA-smoothed, and
+  // is clamped to never rise except while charging. Byte 1 bit 7 = charging LED
+  // (charging or topped off); flags byte bit 0 = plugged in (older firmware that
+  // omits the flags byte is inferred as plugged whenever the charging bit is set).
   void _onStatus(ByteData bd, int len) {
     if (len < 2) return;
-    final pct = bd.getUint8(1);
-    _set(() => _batteryPct = pct);
+    final battByte = bd.getUint8(1);
+    final chargingLed = (battByte & 0x80) != 0;
+    final battMv = len >= 4 ? bd.getUint16(2, Endian.little) : 0;
+    final plugged = len >= 6 ? (bd.getUint8(5) & 0x01) != 0 : chargingLed;
+    // Prefer the mV-based SoC; fall back to the coarse % byte if mV isn't a real
+    // reading yet (0 in the first packets before the board's ADC has run).
+    final battPct = battMv > 0
+        ? _lipoPercentFromMv(battMv)
+        : (battByte & 0x7F).toDouble();
+    _set(() {
+      if (plugged && chargingLed) {
+        // Charging (or charge-complete): the rise is real, lift the never-rise clamp.
+        _charging = true;
+        _notCharging = false;
+        _updateBattery(battPct, charging: true);
+      } else if (plugged) {
+        // Plugged but not charging (switch off): the mV drifts with no real cell,
+        // so freeze the shown % (seed once if we have no reading yet).
+        _notCharging = true;
+        _charging = false;
+        if (_batterySmoothed < 0) _updateBattery(battPct, charging: false);
+      } else {
+        // On battery: normal monotonic discharge.
+        _charging = false;
+        _notCharging = false;
+        _updateBattery(battPct, charging: false);
+      }
+    });
+  }
+
+  // Resting open-circuit-voltage -> state-of-charge for a single LiPo cell.
+  // Linear-interpolates a standard SoC table by millivolts. Verbatim from the
+  // ping-pong app so the reported % matches.
+  double _lipoPercentFromMv(int mv) {
+    const List<int> mvs = [
+      3270, 3610, 3690, 3710, 3730, 3750, 3770, 3790, 3800, 3820, 3840, //
+      3850, 3870, 3910, 3950, 3980, 4020, 4080, 4110, 4150, 4200,
+    ];
+    const List<double> pcts = [
+      0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, //
+      55, 60, 65, 70, 75, 80, 85, 90, 95, 100,
+    ];
+    double raw;
+    if (mv <= mvs.first) {
+      raw = 0;
+    } else if (mv >= mvs.last) {
+      raw = 100;
+    } else {
+      raw = 100;
+      for (int i = 1; i < mvs.length; i++) {
+        if (mv < mvs[i]) {
+          final double t = (mv - mvs[i - 1]) / (mvs[i] - mvs[i - 1]);
+          raw = pcts[i - 1] + t * (pcts[i] - pcts[i - 1]);
+          break;
+        }
+      }
+    }
+    // The charger reports "full" (board stops charging) at ~92% on the raw curve,
+    // so stretch the scale so a full cell reads 100%.
+    return (raw * (100.0 / 92.0)).clamp(0.0, 100.0);
+  }
+
+  // EMA-smooth the raw % and clamp the shown value so it only decreases within a
+  // session (batteries only discharge; a bounce-up is noise). While [charging]
+  // the gate is lifted so the % can track the real rise. Verbatim from ping-pong.
+  void _updateBattery(double raw, {bool charging = false}) {
+    final double r = raw.clamp(0.0, 100.0);
+    if (_batterySmoothed < 0) {
+      _batterySmoothed = r; // first reading seeds the filter
+      _batteryShown = r.round();
+    } else {
+      _batterySmoothed = _batteryAlpha * r + (1 - _batteryAlpha) * _batterySmoothed;
+      final int cand = _batterySmoothed.round();
+      if (charging || cand < _batteryShown) _batteryShown = cand;
+    }
+    _batteryPct = _batteryShown;
   }
 
   void _onCalib(ByteData bd, int len) {
@@ -642,6 +733,8 @@ class FrisbeeBle extends ChangeNotifier {
       _rssi = null;
       _rxChar = null;
       _liveAx = _liveAy = _liveAz = null;
+      _charging = false;
+      _notCharging = false;
     });
     Future.delayed(const Duration(milliseconds: 800), () {
       _reconnectPending = false;
@@ -669,6 +762,12 @@ class FrisbeeBle extends ChangeNotifier {
       _rssi = null;
       _rxChar = null;
       _liveAx = _liveAy = _liveAz = null;
+      // Fresh session: re-seed the battery smoother on the next connect.
+      _batterySmoothed = -1;
+      _batteryShown = -1;
+      _batteryPct = 0;
+      _charging = false;
+      _notCharging = false;
     });
   }
 

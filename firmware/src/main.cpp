@@ -17,7 +17,8 @@
 //   0x02 SAMPLES [u8][u16 firstIndex][u8 n] + n*(int16 ax,ay,az,gx,gy,gz)
 //   0x03 END     [u8][u32 throwId][u16 count][f32 peakA_g][f32 peakG_dps]
 //                [u32 flightMs][u8 labelLen][label...]
-//   0x10 STATUS  [u8][u8 batt%][u16 mV][u8 queuedThrows]     (idle heartbeat)
+//   0x10 STATUS  [u8][u8 batt%|chg<<7][u16 mV][u8 queuedThrows][u8 flags]
+//                (idle heartbeat; batt bit7 = charging LED, flags bit0 = plugged in)
 //   0x11 CALIB   [u8][f32 ax][f32 ay][f32 az][f32 gx][f32 gy][f32 gz]
 //                (one-shot: mean accel = gravity/down vector, mean gyro = bias)
 //   0x12 LIVE    [u8][i16 ax][i16 ay][i16 az]   (raw accel, ~20 Hz while idle,
@@ -55,7 +56,7 @@ const uint8_t UART_RX_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0
 const uint8_t UART_VER_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9,
                                    0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x04, 0x00,
                                    0x40, 0x6E};
-#define FW_VERSION "0.5"
+#define FW_VERSION "0.7"
 
 BLEService uartService(UART_SERVICE_UUID);
 BLECharacteristic txChar(UART_TX_UUID);
@@ -227,6 +228,11 @@ char curLabel[MAX_LABEL + 1] = "unlabeled";
 #define LED_DUTY_RED 128
 #define BATT_LOW_MV 3730
 #define BATT_LOW_CLR 3770
+// Plugged + not charging + VBAT below this => "not charging" (typically the on/off
+// switch is off, so no real cell is on the divider) rather than a completed charge.
+// Set near a full cell so only a nearly-full battery reads solid-green "done". Same
+// value as the ping-pong firmware.
+#define BATT_PRESENT_MV 4100
 enum LedColor { LED_C_OFF, LED_C_BLUE, LED_C_GREEN, LED_C_RED };
 
 // ---------------------------------------------------------------------------
@@ -596,11 +602,21 @@ void updateStatusLed() {
   LedColor color;
   bool on;
   if (pluggedIn) {
-    color = LED_C_GREEN;
-    on = chargeActive ? blink : true;
+    if (chargeActive) {
+      color = LED_C_GREEN;              // actively charging -> blinking green
+      on = blink;
+    } else if (batteryMv >= BATT_PRESENT_MV) {
+      color = LED_C_GREEN;              // charge complete -> solid green
+      on = true;
+    } else {
+      // Plugged, not charging, no healthy cell reading: the switch is off
+      // (battery disconnected). Alternate green/red as a "flip the switch" nudge.
+      color = blink ? LED_C_GREEN : LED_C_RED;
+      on = true;
+    }
   } else {
     color = lowBatt ? LED_C_RED : LED_C_BLUE;
-    on = connected ? true : blink;
+    on = connected ? true : blink;      // solid when connected, blink when searching
   }
   static LedColor lastColor = LED_C_OFF;
   static bool lastOn = false, inited = false;
@@ -811,12 +827,17 @@ void loop() {
     uint32_t nowMs = millis();
     if (nowMs - lastStatusMs >= 1500 && connHdl != BLE_CONN_HANDLE_INVALID &&
         txChar.notifyEnabled(connHdl)) {
-      uint8_t p[5];
+      // Battery byte mirrors the ping-pong encoding: bits 0-6 = %, bit 7 = the
+      // green charging LED (charging or topped off). The plugged flag lets the app
+      // tell "plugged but not charging" (switch off) from on-battery discharging.
+      bool chargingLed = pluggedIn && (chargeActive || batteryMv >= BATT_PRESENT_MV);
+      uint8_t p[6];
       p[0] = PKT_STATUS;
-      p[1] = (uint8_t)batteryPct;
+      p[1] = (uint8_t)(batteryPct & 0x7F) | (chargingLed ? 0x80 : 0);
       memcpy(p + 2, &batteryMv, 2);
       p[4] = (uint8_t)qCount;
-      txChar.notify(p, 5);
+      p[5] = pluggedIn ? 0x01 : 0x00; // flags: bit0 = plugged in
+      txChar.notify(p, 6);
       lastStatusMs = nowMs;
     }
   }

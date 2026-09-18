@@ -298,6 +298,19 @@ class _HomeShellState extends State<HomeShell>
     final scheme = Theme.of(context).colorScheme;
     final Color dim = Theme.of(context).disabledColor;
 
+    // Charge state (from the STATUS heartbeat) surfaces in the status line +
+    // battery bolt, matching the ping-pong app.
+    final bool charging = _ble.charging;
+    final bool notCharging = _ble.notCharging;
+    final String statusText = charging
+        ? "Charging"
+        : notCharging
+        ? "Not charging"
+        : _ble.status;
+    final Color statusColor = notCharging
+        ? Colors.red
+        : (connected ? Colors.green : Colors.red);
+
     // Last-throw readouts reflect the most recent stored throw and stay shown
     // whether or not we're connected (it's historical data), graying only when
     // there are no throws yet.
@@ -343,11 +356,11 @@ class _HomeShellState extends State<HomeShell>
             child: Column(
               children: [
                 Text(
-                  _ble.status,
+                  statusText,
                   style: TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
-                    color: connected ? Colors.green : Colors.red,
+                    color: statusColor,
                   ),
                 ),
                 if (connected && _ble.firmwareVersion.isNotEmpty) ...[
@@ -368,6 +381,7 @@ class _HomeShellState extends State<HomeShell>
                     _batteryIndicator(
                       active ? _ble.batteryPct : 0,
                       active: active,
+                      charging: charging,
                     ),
                     const SizedBox(width: 18),
                     Text(
@@ -510,8 +524,9 @@ class _HomeShellState extends State<HomeShell>
     );
   }
 
-  // Compact battery gauge (ping-pong style). Grays out when disconnected.
-  Widget _batteryIndicator(int pct, {bool active = true}) {
+  // Compact battery gauge (ping-pong style). Grays out when disconnected; shows
+  // a charging bolt over the cell while charging.
+  Widget _batteryIndicator(int pct, {bool active = true, bool charging = false}) {
     final p = pct.clamp(0, 100);
     final Color disabled = Theme.of(context).disabledColor;
     final Color fill = !active
@@ -536,24 +551,38 @@ class _HomeShellState extends State<HomeShell>
           ),
         ),
         const SizedBox(width: 5),
-        Container(
-          width: 32,
-          height: 15,
-          padding: const EdgeInsets.all(1.5),
-          decoration: BoxDecoration(
-            border: Border.all(color: outline, width: 1.2),
-            borderRadius: BorderRadius.circular(3),
-          ),
-          child: FractionallySizedBox(
-            alignment: Alignment.centerLeft,
-            widthFactor: p / 100.0,
-            child: Container(
+        Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              width: 32,
+              height: 15,
+              padding: const EdgeInsets.all(1.5),
               decoration: BoxDecoration(
-                color: fill,
-                borderRadius: BorderRadius.circular(1.5),
+                border: Border.all(color: outline, width: 1.2),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: FractionallySizedBox(
+                alignment: Alignment.centerLeft,
+                widthFactor: p / 100.0,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: fill,
+                    borderRadius: BorderRadius.circular(1.5),
+                  ),
+                ),
               ),
             ),
-          ),
+            // Charging bolt, centred over the cell, with a shadow so it reads
+            // over both the coloured fill and the empty background.
+            if (charging)
+              const Icon(
+                Icons.bolt,
+                size: 13,
+                color: Colors.white,
+                shadows: [Shadow(color: Colors.black87, blurRadius: 2)],
+              ),
+          ],
         ),
         Container(
           width: 2.5,
