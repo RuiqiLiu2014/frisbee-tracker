@@ -35,6 +35,10 @@ final Guid kVersionCharacteristicUuid = Guid(
 //   "ACK:<throwId>\n"   confirm a throw was received (device may then dequeue)
 //   "LABEL:<name>\n"    set the label stamped on subsequent throws
 //   "CLEAR\n"           drop the device's queued throws
+//   "RATE:<hz>\n"       set the capture ODR       "MAXMS:<ms>\n"  cap one throw
+//   "CALIB\n"           request a one-shot calibration reading (0x11 reply)
+//   "PREROLL:<ms>\n"    set the capture pre-roll (windup kept before commit)
+// Also received: 0x11 CALIB (calibration reading), 0x12 LIVE (idle accel).
 // ===========================================================================
 const int _pktBegin = 0x01;
 const int _pktSamples = 0x02;
@@ -106,6 +110,7 @@ class FrisbeeBle extends ChangeNotifier {
   int _batteryPct = 0;
   int? _rssi;
   String _label = "unlabeled";
+  int _preRollMs = kDefaultPreRollMs; // re-sent to the disc on every connect
   // Latest live accel (g), null until the first live packet / after disconnect.
   double? _liveAx, _liveAy, _liveAz;
 
@@ -122,6 +127,7 @@ class FrisbeeBle extends ChangeNotifier {
   int get batteryPct => _batteryPct;
   int? get rssi => _rssi;
   String get label => _label;
+  int get preRollMs => _preRollMs;
   double? get liveAx => _liveAx;
   double? get liveAy => _liveAy;
   double? get liveAz => _liveAz;
@@ -336,9 +342,10 @@ class FrisbeeBle extends ChangeNotifier {
       _status = "Connected";
     });
     _txSub = tx.onValueReceived.listen(_onPacket);
-    // Push the current label so the device stamps throws correctly, and start
-    // polling RSSI (useful for range testing).
+    // Push the current label + pre-roll so the disc matches the app's settings
+    // (the disc forgets them on reset), and start polling RSSI.
     await sendLabel(_label);
+    await _write("PREROLL:$_preRollMs\n");
     _startRssiPolling();
   }
 
@@ -551,6 +558,13 @@ class FrisbeeBle extends ChangeNotifier {
   Future<void> sendLabel(String label) async {
     _set(() => _label = label);
     await _write("LABEL:$label\n");
+  }
+
+  /// Set the capture pre-roll (ms). Stored so it can be re-sent on reconnect;
+  /// the write is a no-op while disconnected.
+  Future<void> sendPreRoll(int ms) async {
+    _preRollMs = ms;
+    await _write("PREROLL:$ms\n");
   }
 
   Future<void> _sendAck(int throwId) => _write("ACK:$throwId\n");

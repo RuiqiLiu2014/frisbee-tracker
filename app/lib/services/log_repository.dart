@@ -12,8 +12,12 @@ import '../models/throw_log.dart';
 /// writes the app documents `logs/` directory. Binary `.bin` files survive
 /// restart; CSV/zip is produced on demand for the system share sheet.
 class LogRepository {
-  // v2 added the separate throwClass field; v3 bakes in the per-throw calibration.
-  static const int _formatVersion = 3;
+  // v2 added the separate throwClass field; v3 bakes in the per-throw calibration;
+  // v4 stores samples already rotated into the disc frame (z = disc normal). The
+  // byte layout is unchanged from v3 — the bump only records that axes are
+  // disc-frame. v3 and older hold board-frame samples (their baked calib could
+  // rotate them on load if ever needed).
+  static const int _formatVersion = 4;
 
   Future<Directory> _logsDir() async {
     final base = await getApplicationDocumentsDirectory();
@@ -137,7 +141,7 @@ class LogRepository {
     if (bytes.length < 8) return null;
     final version = bd.getInt32(off, Endian.little);
     off += 4;
-    if (version < 1 || version > 3) return null;
+    if (version < 1 || version > 4) return null;
     final throwId = bd.getInt32(off, Endian.little);
     off += 4;
     final n = bd.getInt32(off, Endian.little);
@@ -250,6 +254,14 @@ class LogRepository {
   }
 
   String csvFor(ThrowLog log) {
+    // Samples are disc-frame (z = disc normal) when a calibration was baked in;
+    // otherwise they're the board frame. The calib is emitted so the raw board
+    // frame stays reconstructable from the (rotated) values.
+    final hasCalib = log.calib != null && log.calib!.length >= 3;
+    final frame = hasCalib ? "disc" : "board";
+    final calibStr = hasCalib
+        ? log.calib!.map((c) => c.toStringAsFixed(6)).join(' ')
+        : "";
     final sb = StringBuffer()
       ..write(
         "# throw_id=${log.throwId},class=${log.throwClass},name=${log.name},"
@@ -257,7 +269,8 @@ class LogRepository {
         "sample_rate_hz=${log.sampleRateHz.toStringAsFixed(1)},"
         "dropped=${log.droppedSamples},"
         "peak_accel_g=${log.peakAccelG.toStringAsFixed(4)},"
-        "peak_gyro_dps=${log.peakGyroDps.toStringAsFixed(2)}\n",
+        "peak_gyro_dps=${log.peakGyroDps.toStringAsFixed(2)},"
+        "frame=$frame,calib=$calibStr\n",
       )
       ..write("time_s,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n");
     for (int i = 0; i < log.count; i++) {

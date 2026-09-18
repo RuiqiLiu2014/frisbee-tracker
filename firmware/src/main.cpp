@@ -23,7 +23,7 @@
 //   0x12 LIVE    [u8][i16 ax][i16 ay][i16 az]   (raw accel, ~20 Hz while idle,
 //                for a live tilt + accel-magnitude readout; NOT throw data)
 // App -> device (ASCII, newline): "ACK:<id>", "LABEL:<s>", "CLEAR",
-//   "RATE:<hz>", "MAXMS:<ms>", "CALIB".
+//   "RATE:<hz>", "MAXMS:<ms>", "CALIB", "PREROLL:<ms>".
 
 #include <Arduino.h>
 #include <bluefruit.h>
@@ -55,7 +55,7 @@ const uint8_t UART_RX_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0
 const uint8_t UART_VER_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9,
                                    0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x04, 0x00,
                                    0x40, 0x6E};
-#define FW_VERSION "0.3"
+#define FW_VERSION "0.4"
 
 BLEService uartService(UART_SERVICE_UUID);
 BLECharacteristic txChar(UART_TX_UUID);
@@ -78,22 +78,36 @@ BLECharacteristic verChar(UART_VER_UUID);
 // Runtime settings (adjustable from the app; defaults here)
 // ---------------------------------------------------------------------------
 static uint16_t odrHz = 416;        // ~400 Hz target; nearest LSM6DS3 hardware ODR
-static uint32_t maxThrowMs = 5000;  // hard cap on a single capture
+static uint32_t maxThrowMs = 3000;  // hard cap on a single capture (see below)
 
-// Throw start/stop detection thresholds. These are the values tuned + validated
-// on real throws in the old Nano/BMI270 firmware; they're in physical units
-// (g, dps) so they carry over to the LSM6DS3.
-static const float THROW_ACCEL_G = 2.5f;
-static const float THROW_GYRO_DPS = 150.0f;
+// Throw detection works on the SPIN AXIS (gyro projected onto the disc normal),
+// NOT total gyro magnitude or accel. Field data: real throws pin the spin axis at
+// 1911-2293 dps while handling/walking never exceeds ~145 dps there (13x gap) even
+// though handling easily crosses a total-magnitude (515 dps) or accel (4.6 g)
+// threshold. We ARM when the spin crosses THROW_ARM_DPS and only COMMIT once it
+// stays above THROW_SUSTAIN_DPS for CONFIRM_MS (brief handling spikes stand down);
+// the pre-roll ring back-fills the windup so waiting to confirm loses nothing.
+// 400 dps is provisional with wide margin both ways; retune with weak-thrower data.
+static const float THROW_ARM_DPS = 400.0f;
+static const float THROW_SUSTAIN_DPS = 300.0f;
+static const uint32_t CONFIRM_MS = 250;
 static const float STOP_GYRO_DPS = 100.0f;
 static const uint32_t STOP_DEBOUNCE_MS = 200;
 static const uint32_t MIN_THROW_MS = 250;
 static const uint16_t MIN_SAMPLES = 24;
-// Pre-trigger is a SAMPLE count, so its time span = PRE_TRIGGER/odrHz. The old
-// firmware's 30 samples @ ~45 Hz was ~0.67 s of windup lead-in; at 416 Hz we
-// need many more samples to keep a comparable window (~0.5 s here). Preliminary
-// value — refine once D1 measures real windup->release duration.
-#define PRE_TRIGGER 208
+
+// Pre-roll ring: raw samples kept BEFORE a throw commits so the windup/backswing
+// is captured retroactively. Its length is a runtime setting (PREROLL:<ms> from
+// the app); the buffer is sized for the max and the active length in samples is
+// preRollMs*odrHz/1000, clamped to PRE_MAX_SAMPLES. A single throw is capped at
+// maxThrowMs of flight PLUS the pre-roll, so it can never grow without bound (see
+// appendSample) — that keeps one throw from eating the whole arena.
+#define PRE_MAX_SAMPLES 1300  // buffer capacity (~3.1 s at 416 Hz)
+static const uint32_t PREROLL_DEFAULT_MS = 1500;
+static const uint32_t PREROLL_MIN_MS = 200;
+static const uint32_t PREROLL_MAX_MS = 3000;
+static uint32_t preRollMs = PREROLL_DEFAULT_MS;
+static uint16_t preTriggerSamples = 624;  // recomputed by setPreRoll()
 #define MAX_LABEL 16
 
 // ---------------------------------------------------------------------------
@@ -140,10 +154,11 @@ static void arenaReadAt(uint32_t offset, uint8_t *dst, uint32_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-trigger ring (raw samples captured just before the throw is detected)
+// Pre-roll ring (raw samples captured just before a throw commits). Sized for
+// the max pre-roll; the active length is preTriggerSamples. Magnitudes are
+// recomputed at fold-in (magFrom12), so no parallel magnitude arrays are kept.
 // ---------------------------------------------------------------------------
-static uint8_t preBuf[PRE_TRIGGER][SAMPLE_BYTES];
-static float preMagA[PRE_TRIGGER], preMagG[PRE_TRIGGER];
+static uint8_t preBuf[PRE_MAX_SAMPLES][SAMPLE_BYTES];
 static uint16_t preWrite = 0, preCount = 0;
 
 // ---------------------------------------------------------------------------
@@ -157,6 +172,16 @@ static uint32_t throwStartMs = 0;
 static uint32_t curThrowId = 0;
 static bool inLowSpin = false;
 static uint32_t lowSpinStartMs = 0;
+
+// Throw-arming state (spin-axis start detection).
+static bool arming = false;
+static uint32_t armStartMs = 0;
+
+// Disc up-normal in the board frame (unit vector), set by the last on-board
+// calibration. Defaults to the board z-axis, so before any calibration the spin
+// projection is just |gz| (which is within ~0.2 % of true spin at small mount
+// tilts). Used only for the detection trigger; the phone does the full rotation.
+static float calNormal[3] = {0.0f, 0.0f, 1.0f};
 
 enum UpPhase { UP_BEGIN, UP_SAMPLES, UP_END };
 static UpPhase upPhase = UP_BEGIN;
@@ -194,14 +219,30 @@ enum LedColor { LED_C_OFF, LED_C_BLUE, LED_C_GREEN, LED_C_RED };
 // ---------------------------------------------------------------------------
 volatile bool g_hasAck = false, g_hasLabel = false, g_hasClear = false;
 volatile bool g_hasRate = false, g_hasMaxMs = false, g_hasCalib = false;
+volatile bool g_hasPreRoll = false;
 volatile uint32_t g_pendingAckId = 0;
 volatile uint16_t g_pendingRate = 0;
 volatile uint32_t g_pendingMaxMs = 0;
+volatile uint32_t g_pendingPreRoll = 0;
 char g_pendingLabel[MAX_LABEL + 1] = "";
 
 // ===========================================================================
 // IMU
 // ===========================================================================
+// Set the pre-roll length (ms -> samples for the current ODR), clamped to the
+// buffer. Resets the ring since the modulo base changes. Never call mid-record.
+static void setPreRoll(uint32_t ms) {
+  if (ms < PREROLL_MIN_MS) ms = PREROLL_MIN_MS;
+  if (ms > PREROLL_MAX_MS) ms = PREROLL_MAX_MS;
+  preRollMs = ms;
+  uint32_t s = ms * (uint32_t)odrHz / 1000;
+  if (s < 1) s = 1;
+  if (s > PRE_MAX_SAMPLES) s = PRE_MAX_SAMPLES;
+  preTriggerSamples = (uint16_t)s;
+  preWrite = 0;
+  preCount = 0;
+}
+
 static void setOdr(uint16_t hz) {
   const uint16_t allowed[] = {104, 208, 416, 833, 1660};
   uint16_t best = 1660;
@@ -215,6 +256,7 @@ static void setOdr(uint16_t hz) {
   myIMU.settings.accelSampleRate = best;
   myIMU.begin();
   Wire1.setClock(400000);
+  setPreRoll(preRollMs); // sample count depends on the rate
 }
 
 // Read one fresh sample. Fills out12 (accel-first raw bytes) + magnitudes.
@@ -239,12 +281,38 @@ static bool readSample(uint8_t out12[12], float *accG, float *gyrDps) {
   return true;
 }
 
+// Accel + total-gyro magnitudes from a stored raw sample (used to seed peaks when
+// folding the pre-roll into a throw, without keeping parallel magnitude arrays).
+static void magFrom12(const uint8_t *s12, float *accG, float *gyrDps) {
+  int16_t ax = (int16_t)(s12[0] | (s12[1] << 8));
+  int16_t ay = (int16_t)(s12[2] | (s12[3] << 8));
+  int16_t az = (int16_t)(s12[4] | (s12[5] << 8));
+  int16_t gx = (int16_t)(s12[6] | (s12[7] << 8));
+  int16_t gy = (int16_t)(s12[8] | (s12[9] << 8));
+  int16_t gz = (int16_t)(s12[10] | (s12[11] << 8));
+  float axg = ax * ACCEL_SCALE_G, ayg = ay * ACCEL_SCALE_G, azg = az * ACCEL_SCALE_G;
+  float gxd = gx * GYRO_SCALE_DPS, gyd = gy * GYRO_SCALE_DPS, gzd = gz * GYRO_SCALE_DPS;
+  *accG = sqrtf(axg * axg + ayg * ayg + azg * azg);
+  *gyrDps = sqrtf(gxd * gxd + gyd * gyd + gzd * gzd);
+}
+
+// Spin rate about the (calibrated) disc normal, dps. calNormal defaults to the
+// board z-axis, so before any calibration this reduces to |gz|.
+static float spinAboutNormal(const uint8_t *s12) {
+  int16_t gx = (int16_t)(s12[6] | (s12[7] << 8));
+  int16_t gy = (int16_t)(s12[8] | (s12[9] << 8));
+  int16_t gz = (int16_t)(s12[10] | (s12[11] << 8));
+  float gxd = gx * GYRO_SCALE_DPS, gyd = gy * GYRO_SCALE_DPS, gzd = gz * GYRO_SCALE_DPS;
+  return fabsf(gxd * calNormal[0] + gyd * calNormal[1] + gzd * calNormal[2]);
+}
+
 // ===========================================================================
 // Recording
 // ===========================================================================
 static bool appendSample(const uint8_t *s12, float accG, float gyrDps) {
   if (arenaFree() < SAMPLE_BYTES || recSamples >= 65000 ||
-      recBytes >= (maxThrowMs * (uint32_t)odrHz / 1000 + PRE_TRIGGER) * SAMPLE_BYTES) {
+      recBytes >= (maxThrowMs * (uint32_t)odrHz / 1000 + preTriggerSamples) *
+                      SAMPLE_BYTES) {
     return false; // storage full or throw too long
   }
   arenaWrite(s12, SAMPLE_BYTES);
@@ -265,11 +333,13 @@ static void startRecording() {
   throwStartMs = millis();
   curThrowId++;
   recording = true;
-  // Fold in the pre-trigger history, oldest first.
-  uint16_t oldest = (preWrite + PRE_TRIGGER - preCount) % PRE_TRIGGER;
+  // Fold in the pre-roll history, oldest first (recompute magnitudes).
+  uint16_t oldest = (preWrite + preTriggerSamples - preCount) % preTriggerSamples;
   for (uint16_t i = 0; i < preCount; i++) {
-    uint16_t idx = (oldest + i) % PRE_TRIGGER;
-    appendSample(preBuf[idx], preMagA[idx], preMagG[idx]);
+    uint16_t idx = (oldest + i) % preTriggerSamples;
+    float a, g;
+    magFrom12(preBuf[idx], &a, &g);
+    appendSample(preBuf[idx], a, g);
   }
 }
 
@@ -405,6 +475,14 @@ static void doCalibration() {
       (float)(sax / got) * ACCEL_SCALE_G, (float)(say / got) * ACCEL_SCALE_G,
       (float)(saz / got) * ACCEL_SCALE_G, (float)(sgx / got) * GYRO_SCALE_DPS,
       (float)(sgy / got) * GYRO_SCALE_DPS, (float)(sgz / got) * GYRO_SCALE_DPS};
+  // The mean accel vector (disc flat + still) points up along the disc normal.
+  // Store its unit vector for the spin-axis projection in throw detection.
+  float nmag = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (nmag > 0.1f) {
+    calNormal[0] = v[0] / nmag;
+    calNormal[1] = v[1] / nmag;
+    calNormal[2] = v[2] / nmag;
+  }
   uint8_t p[1 + 24];
   p[0] = PKT_CALIB;
   memcpy(p + 1, v, 24);
@@ -421,6 +499,7 @@ static void processCommands() {
   if (g_hasClear) {
     g_hasClear = false;
     recording = false;
+    arming = false;
     qHead = qCount = 0;
     arenaHead = arenaCount = 0;
     waitingAck = false;
@@ -450,6 +529,10 @@ static void processCommands() {
   if (g_hasCalib && !recording) {
     g_hasCalib = false;
     doCalibration();
+  }
+  if (g_hasPreRoll && !recording) {
+    g_hasPreRoll = false;
+    setPreRoll(g_pendingPreRoll);
   }
 }
 
@@ -552,6 +635,9 @@ void rxWriteCallback(uint16_t ch, BLECharacteristic *c, uint8_t *data,
   } else if (!strncmp(buf, "MAXMS:", 6)) {
     g_pendingMaxMs = (uint32_t)atol(buf + 6);
     g_hasMaxMs = true;
+  } else if (!strncmp(buf, "PREROLL:", 8)) {
+    g_pendingPreRoll = (uint32_t)atol(buf + 8);
+    g_hasPreRoll = true;
   }
 }
 
@@ -577,6 +663,7 @@ void setup() {
     while (1) {}
   }
   Wire1.setClock(400000);
+  setPreRoll(preRollMs); // size the pre-roll ring for the active ODR
 
   pinMode(PIN_VBAT, INPUT);
   pinMode(VBAT_ENABLE, OUTPUT);
@@ -645,11 +732,22 @@ void loop() {
     liveAz = (int16_t)(s12[4] | (s12[5] << 8));
     if (!recording) {
       memcpy(preBuf[preWrite], s12, SAMPLE_BYTES);
-      preMagA[preWrite] = accG;
-      preMagG[preWrite] = gyrDps;
-      preWrite = (preWrite + 1) % PRE_TRIGGER;
-      if (preCount < PRE_TRIGGER) preCount++;
-      if (accG > THROW_ACCEL_G && gyrDps > THROW_GYRO_DPS) startRecording();
+      preWrite = (preWrite + 1) % preTriggerSamples;
+      if (preCount < preTriggerSamples) preCount++;
+      // Spin-axis arming: commit only after spin about the disc normal is
+      // sustained, so brief handling/walking spikes never start a recording.
+      float spin = spinAboutNormal(s12);
+      if (!arming) {
+        if (spin > THROW_ARM_DPS) {
+          arming = true;
+          armStartMs = millis();
+        }
+      } else if (spin < THROW_SUSTAIN_DPS) {
+        arming = false; // transient -> stand down
+      } else if (millis() - armStartMs >= CONFIRM_MS) {
+        arming = false;
+        startRecording();
+      }
     } else {
       if (!appendSample(s12, accG, gyrDps)) {
         finishRecording(); // storage full or throw too long

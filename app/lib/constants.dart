@@ -12,6 +12,14 @@ const double kGyroScaleDps = 70.0 / 1000.0; // dps per raw count
 // report an explicit capture rate.
 const double kNominalOdrHz = 1660.0;
 
+// Pre-roll: how much windup/backswing the disc keeps before a throw commits.
+// Sent to the firmware as PREROLL:<ms>; the slider steps in 0.1 s. Range matches
+// the firmware clamp (200-3000 ms).
+const int kDefaultPreRollMs = 1500;
+const int kMinPreRollMs = 300;
+const int kMaxPreRollMs = 3000;
+const int kPreRollStepMs = 100;
+
 // Chart palette, shared by charts and legends. Accel = warm/primary triad,
 // gyro = secondary triad.
 const List<Color> kAccelColors = [Colors.red, Colors.green, Colors.blue];

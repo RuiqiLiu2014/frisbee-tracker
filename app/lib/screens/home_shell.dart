@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../constants.dart';
+import '../frame.dart';
 import '../models/throw_log.dart';
 import '../services/frisbee_ble.dart';
 import '../services/log_repository.dart';
@@ -48,6 +49,16 @@ class _HomeShellState extends State<HomeShell>
     _loadLogs();
     _loadCalibStatus();
     _loadLabel();
+    _loadPreRoll();
+  }
+
+  Future<void> _loadPreRoll() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ms = prefs.getInt(kPreRollKey) ?? kDefaultPreRollMs;
+    preRollMsNotifier.value = ms;
+    // Seed the BLE service so it re-sends the right value on connect (the write
+    // itself no-ops while disconnected).
+    _ble.sendPreRoll(ms);
   }
 
   Future<void> _loadCalibStatus() async {
@@ -131,12 +142,17 @@ class _HomeShellState extends State<HomeShell>
     _logSeq++;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(kLogSeqKey, _logSeq);
+    // Rotate the raw board-frame samples into the canonical disc frame (z = disc
+    // normal) using the calibration active at capture, then store the rotated
+    // floats. Rotation preserves magnitude, so the peaks carry over unchanged.
+    // The calib is baked in too, so the raw board frame stays recoverable.
+    final discAxes = toDiscFrame(r.axes, r.count, _calibFull);
     final log = ThrowLog(
       id: _logSeq,
       throwId: r.throwId,
       timestamp: DateTime.now(),
       t: r.t,
-      axes: r.axes,
+      axes: discAxes,
       count: r.count,
       durationSec: r.count > 0 ? r.t[r.count - 1] : 0,
       sampleRateHz: r.sampleRateHz,
@@ -267,7 +283,7 @@ class _HomeShellState extends State<HomeShell>
         children: [
           _buildConnectTab(),
           _buildThrowsTab(),
-          SettingsTab(storageBytes: _storageBytes),
+          SettingsTab(storageBytes: _storageBytes, ble: _ble),
         ],
       ),
       ),

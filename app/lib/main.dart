@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'constants.dart';
 import 'settings.dart';
 import 'theme.dart';
 import 'screens/home_shell.dart';
@@ -15,6 +16,7 @@ Future<void> main() async {
   colorSwapNotifier.value = parseColorSwap(prefs.getString(kColorSwapKey));
   showAccelNotifier.value = prefs.getBool(kShowAccelKey) ?? true;
   showGyroNotifier.value = prefs.getBool(kShowGyroKey) ?? true;
+  preRollMsNotifier.value = prefs.getInt(kPreRollKey) ?? kDefaultPreRollMs;
   runApp(const FrisbeeTrackerApp());
 }
 

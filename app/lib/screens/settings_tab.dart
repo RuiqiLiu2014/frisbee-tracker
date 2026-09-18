@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../constants.dart';
+import '../services/frisbee_ble.dart';
 import '../settings.dart';
 import '../theme.dart';
 
@@ -11,7 +12,8 @@ import '../theme.dart';
 /// changes (MaterialApp listens), so the swatches refresh without local state.
 class SettingsTab extends StatelessWidget {
   final int storageBytes;
-  const SettingsTab({super.key, required this.storageBytes});
+  final FrisbeeBle ble;
+  const SettingsTab({super.key, required this.storageBytes, required this.ble});
 
   Future<void> _saveString(String key, String value) async {
     final p = await SharedPreferences.getInstance();
@@ -21,6 +23,11 @@ class SettingsTab extends StatelessWidget {
   Future<void> _saveBool(String key, bool value) async {
     final p = await SharedPreferences.getInstance();
     await p.setBool(key, value);
+  }
+
+  Future<void> _saveInt(String key, int value) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setInt(key, value);
   }
 
   String _fmtBytes(int b) {
@@ -189,6 +196,58 @@ class SettingsTab extends StatelessWidget {
               _saveBool(kShowGyroKey, nv);
             },
           ),
+        ),
+        const Divider(height: 24),
+        const Text(
+          "Throw capture",
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        ValueListenableBuilder<int>(
+          valueListenable: preRollMsNotifier,
+          builder: (context, ms, _) {
+            final clamped = ms
+                .toDouble()
+                .clamp(kMinPreRollMs.toDouble(), kMaxPreRollMs.toDouble());
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    "Pre-roll: ${(ms / 1000).toStringAsFixed(1)} s",
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                Text(
+                  "How much windup the disc keeps before a throw is detected.",
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                Slider(
+                  value: clamped,
+                  min: kMinPreRollMs.toDouble(),
+                  max: kMaxPreRollMs.toDouble(),
+                  divisions:
+                      ((kMaxPreRollMs - kMinPreRollMs) / kPreRollStepMs).round(),
+                  label: "${(ms / 1000).toStringAsFixed(1)} s",
+                  onChanged: (v) {
+                    final snapped =
+                        (v / kPreRollStepMs).round() * kPreRollStepMs;
+                    preRollMsNotifier.value = snapped;
+                  },
+                  onChangeEnd: (v) {
+                    final snapped =
+                        (v / kPreRollStepMs).round() * kPreRollStepMs;
+                    preRollMsNotifier.value = snapped;
+                    _saveInt(kPreRollKey, snapped);
+                    ble.sendPreRoll(snapped); // no-op while disconnected
+                  },
+                ),
+              ],
+            );
+          },
         ),
         const Divider(height: 24),
         const Text(
