@@ -55,7 +55,7 @@ const uint8_t UART_RX_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0
 const uint8_t UART_VER_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9,
                                    0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x04, 0x00,
                                    0x40, 0x6E};
-#define FW_VERSION "0.4"
+#define FW_VERSION "0.5"
 
 BLEService uartService(UART_SERVICE_UUID);
 BLECharacteristic txChar(UART_TX_UUID);
@@ -84,17 +84,32 @@ static uint32_t maxThrowMs = 3000;  // hard cap on a single capture (see below)
 // NOT total gyro magnitude or accel. Field data: real throws pin the spin axis at
 // 1911-2293 dps while handling/walking never exceeds ~145 dps there (13x gap) even
 // though handling easily crosses a total-magnitude (515 dps) or accel (4.6 g)
-// threshold. We ARM when the spin crosses THROW_ARM_DPS and only COMMIT once it
-// stays above THROW_SUSTAIN_DPS for CONFIRM_MS (brief handling spikes stand down);
-// the pre-roll ring back-fills the windup so waiting to confirm loses nothing.
+// threshold. Arming requires a RELEASE SIGNATURE: the spin must be high (>
+// THROW_ARM_DPS) AND have just risen fast (by > THROW_RISE_DPS over RISE_WINDOW_MS).
+// The rising-edge requirement is essential: a throw longer than maxThrowMs gets
+// force-finished mid-flight while the disc is still spinning, and a level-only arm
+// would instantly re-trigger on that still-high spin, splitting one long throw into
+// 2-3 logs. A truncated tail is high but FLAT, so it has no rise and won't re-arm.
+// After arming we COMMIT only once spin stays above THROW_SUSTAIN_DPS for CONFIRM_MS
+// (brief handling spikes stand down); the pre-roll ring back-fills the windup.
 // 400 dps is provisional with wide margin both ways; retune with weak-thrower data.
 static const float THROW_ARM_DPS = 400.0f;
+static const float THROW_RISE_DPS = 300.0f;    // min spin-up over RISE_WINDOW_MS to arm
+static const uint32_t RISE_WINDOW_MS = 150;    // lookback for the rise test
 static const float THROW_SUSTAIN_DPS = 300.0f;
 static const uint32_t CONFIRM_MS = 250;
 static const float STOP_GYRO_DPS = 100.0f;
 static const uint32_t STOP_DEBOUNCE_MS = 200;
 static const uint32_t MIN_THROW_MS = 250;
 static const uint16_t MIN_SAMPLES = 24;
+
+// Spin history for the rise test: the spin value from ~RISE_WINDOW_MS ago, kept in
+// a small ring updated EVERY sample (including while recording, so the value seen
+// right after a max-length cutoff reflects the still-high in-flight spin -> no rise).
+#define RISE_HIST 256
+static float spinHist[RISE_HIST];
+static uint16_t spinHistWrite = 0;
+static uint16_t riseLookback = 62;  // samples; recomputed for the ODR
 
 // Pre-roll ring: raw samples kept BEFORE a throw commits so the windup/backswing
 // is captured retroactively. Its length is a runtime setting (PREROLL:<ms> from
@@ -243,6 +258,14 @@ static void setPreRoll(uint32_t ms) {
   preCount = 0;
 }
 
+// Rise-test lookback in samples for the current ODR (~RISE_WINDOW_MS ago).
+static void setRiseLookback() {
+  uint32_t s = RISE_WINDOW_MS * (uint32_t)odrHz / 1000;
+  if (s < 1) s = 1;
+  if (s > RISE_HIST - 1) s = RISE_HIST - 1;
+  riseLookback = (uint16_t)s;
+}
+
 static void setOdr(uint16_t hz) {
   const uint16_t allowed[] = {104, 208, 416, 833, 1660};
   uint16_t best = 1660;
@@ -257,6 +280,7 @@ static void setOdr(uint16_t hz) {
   myIMU.begin();
   Wire1.setClock(400000);
   setPreRoll(preRollMs); // sample count depends on the rate
+  setRiseLookback();
 }
 
 // Read one fresh sample. Fills out12 (accel-first raw bytes) + magnitudes.
@@ -664,6 +688,7 @@ void setup() {
   }
   Wire1.setClock(400000);
   setPreRoll(preRollMs); // size the pre-roll ring for the active ODR
+  setRiseLookback();
 
   pinMode(PIN_VBAT, INPUT);
   pinMode(VBAT_ENABLE, OUTPUT);
@@ -730,15 +755,23 @@ void loop() {
     liveAx = (int16_t)(s12[0] | (s12[1] << 8));
     liveAy = (int16_t)(s12[2] | (s12[3] << 8));
     liveAz = (int16_t)(s12[4] | (s12[5] << 8));
+    // Spin about the disc normal + rise vs ~RISE_WINDOW_MS ago. Updated EVERY
+    // sample (even while recording) so that right after a max-length cutoff the
+    // baseline reflects the still-high in-flight spin -> no rise -> no re-arm.
+    float spin = spinAboutNormal(s12);
+    float spinPast = spinHist[(spinHistWrite + RISE_HIST - riseLookback) % RISE_HIST];
+    spinHist[spinHistWrite] = spin;
+    spinHistWrite = (spinHistWrite + 1) % RISE_HIST;
     if (!recording) {
       memcpy(preBuf[preWrite], s12, SAMPLE_BYTES);
       preWrite = (preWrite + 1) % preTriggerSamples;
       if (preCount < preTriggerSamples) preCount++;
-      // Spin-axis arming: commit only after spin about the disc normal is
-      // sustained, so brief handling/walking spikes never start a recording.
-      float spin = spinAboutNormal(s12);
+      // Arm on a RELEASE signature: high spin AND a fast rise into it. The rise
+      // requirement stops a max-length-truncated throw (spin high but flat) from
+      // instantly re-arming and splitting one long throw into several logs. Then
+      // commit only after the spin is SUSTAINED, so brief handling spikes stand down.
       if (!arming) {
-        if (spin > THROW_ARM_DPS) {
+        if (spin > THROW_ARM_DPS && (spin - spinPast) > THROW_RISE_DPS) {
           arming = true;
           armStartMs = millis();
         }
