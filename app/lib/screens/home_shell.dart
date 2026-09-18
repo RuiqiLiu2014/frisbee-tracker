@@ -277,8 +277,6 @@ class _HomeShellState extends State<HomeShell>
   // ---- Connect tab ----
   Widget _buildConnectTab() {
     final connected = _ble.isConnected;
-    final connecting =
-        _ble.state == ConnState.scanning || _ble.state == ConnState.connecting;
     final active = connected;
     final last = _logs.isNotEmpty ? _logs.first : null;
     final scheme = Theme.of(context).colorScheme;
@@ -451,9 +449,11 @@ class _HomeShellState extends State<HomeShell>
                 ),
               const SizedBox(height: 8),
               ElevatedButton(
-                onPressed: connecting
-                    ? null
-                    : (connected ? _ble.disconnect : _ble.startScanAndConnect),
+                // Start scan when idle; from any other state this button stops
+                // (which sets the manual-stop flag, so no auto-reconnect).
+                onPressed: _ble.state == ConnState.disconnected
+                    ? _ble.startScan
+                    : _ble.disconnect,
                 style: ElevatedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 40,
@@ -461,9 +461,12 @@ class _HomeShellState extends State<HomeShell>
                   ),
                 ),
                 child: Text(
-                  connecting
-                      ? "Connecting…"
-                      : (connected ? "Disconnect" : "Connect to Disc"),
+                  switch (_ble.state) {
+                    ConnState.connected => "Disconnect",
+                    ConnState.scanning => "Stop scanning",
+                    ConnState.connecting => "Connecting…",
+                    ConnState.disconnected => "Start scan",
+                  },
                   style: const TextStyle(fontSize: 18),
                 ),
               ),

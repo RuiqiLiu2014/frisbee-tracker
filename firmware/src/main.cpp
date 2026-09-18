@@ -18,8 +18,12 @@
 //   0x03 END     [u8][u32 throwId][u16 count][f32 peakA_g][f32 peakG_dps]
 //                [u32 flightMs][u8 labelLen][label...]
 //   0x10 STATUS  [u8][u8 batt%][u16 mV][u8 queuedThrows]     (idle heartbeat)
+//   0x11 CALIB   [u8][f32 ax][f32 ay][f32 az][f32 gx][f32 gy][f32 gz]
+//                (one-shot: mean accel = gravity/down vector, mean gyro = bias)
+//   0x12 LIVE    [u8][i16 ax][i16 ay][i16 az]   (raw accel, ~20 Hz while idle,
+//                for a live tilt + accel-magnitude readout; NOT throw data)
 // App -> device (ASCII, newline): "ACK:<id>", "LABEL:<s>", "CLEAR",
-//   "RATE:<hz>", "MAXMS:<ms>".
+//   "RATE:<hz>", "MAXMS:<ms>", "CALIB".
 
 #include <Arduino.h>
 #include <bluefruit.h>
@@ -51,7 +55,7 @@ const uint8_t UART_RX_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0
 const uint8_t UART_VER_UUID[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9,
                                    0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x04, 0x00,
                                    0x40, 0x6E};
-#define FW_VERSION "0.1"
+#define FW_VERSION "0.3"
 
 BLEService uartService(UART_SERVICE_UUID);
 BLECharacteristic txChar(UART_TX_UUID);
@@ -65,6 +69,8 @@ BLECharacteristic verChar(UART_VER_UUID);
 #define PKT_SAMPLES 0x02
 #define PKT_END 0x03
 #define PKT_STATUS 0x10
+#define PKT_CALIB 0x11
+#define PKT_LIVE 0x12
 #define SAMPLE_BYTES 12
 #define MAX_PKT_SAMPLES 20 // 4 + 20*12 = 244 <= 247 MTU payload
 
@@ -169,6 +175,8 @@ int batteryPct = 100;
 uint16_t batteryMv = 0;
 uint32_t lastBattUs = 0;
 uint32_t lastStatusMs = 0;
+uint32_t lastLiveMs = 0;
+int16_t liveAx = 0, liveAy = 0, liveAz = 0; // latest raw accel for the live readout
 bool pluggedIn = false, chargeActive = false, lowBatt = false;
 char curLabel[MAX_LABEL + 1] = "unlabeled";
 
@@ -185,7 +193,7 @@ enum LedColor { LED_C_OFF, LED_C_BLUE, LED_C_GREEN, LED_C_RED };
 // Commands from the app (RX write callback sets flags; loop() acts on them)
 // ---------------------------------------------------------------------------
 volatile bool g_hasAck = false, g_hasLabel = false, g_hasClear = false;
-volatile bool g_hasRate = false, g_hasMaxMs = false;
+volatile bool g_hasRate = false, g_hasMaxMs = false, g_hasCalib = false;
 volatile uint32_t g_pendingAckId = 0;
 volatile uint16_t g_pendingRate = 0;
 volatile uint32_t g_pendingMaxMs = 0;
@@ -370,6 +378,43 @@ static void uploadStep() {
 }
 
 // ===========================================================================
+// Calibration: average a short still window (disc flat on the floor) and send
+// the mean accel (gravity/down vector) + mean gyro (zero-rate bias) back once.
+// This is a one-shot request/response, NOT a live stream.
+// ===========================================================================
+static void doCalibration() {
+  const int target = 200; // ~0.5 s at 416 Hz
+  double sax = 0, say = 0, saz = 0, sgx = 0, sgy = 0, sgz = 0;
+  int got = 0;
+  uint32_t t0 = millis();
+  uint8_t s12[12];
+  float a, g;
+  while (got < target && millis() - t0 < 1500) {
+    if (readSample(s12, &a, &g)) {
+      sax += (int16_t)(s12[0] | (s12[1] << 8));
+      say += (int16_t)(s12[2] | (s12[3] << 8));
+      saz += (int16_t)(s12[4] | (s12[5] << 8));
+      sgx += (int16_t)(s12[6] | (s12[7] << 8));
+      sgy += (int16_t)(s12[8] | (s12[9] << 8));
+      sgz += (int16_t)(s12[10] | (s12[11] << 8));
+      got++;
+    }
+  }
+  if (got < 20) return; // too few samples -> stay silent, the app times out
+  float v[6] = {
+      (float)(sax / got) * ACCEL_SCALE_G, (float)(say / got) * ACCEL_SCALE_G,
+      (float)(saz / got) * ACCEL_SCALE_G, (float)(sgx / got) * GYRO_SCALE_DPS,
+      (float)(sgy / got) * GYRO_SCALE_DPS, (float)(sgz / got) * GYRO_SCALE_DPS};
+  uint8_t p[1 + 24];
+  p[0] = PKT_CALIB;
+  memcpy(p + 1, v, 24);
+  if (connected && connHdl != BLE_CONN_HANDLE_INVALID &&
+      txChar.notifyEnabled(connHdl)) {
+    txChar.notify(p, sizeof(p));
+  }
+}
+
+// ===========================================================================
 // Commands
 // ===========================================================================
 static void processCommands() {
@@ -401,6 +446,10 @@ static void processCommands() {
   if (g_hasRate && !recording) {
     g_hasRate = false;
     setOdr(g_pendingRate);
+  }
+  if (g_hasCalib && !recording) {
+    g_hasCalib = false;
+    doCalibration();
   }
 }
 
@@ -495,6 +544,8 @@ void rxWriteCallback(uint16_t ch, BLECharacteristic *c, uint8_t *data,
     g_hasLabel = true;
   } else if (!strcmp(buf, "CLEAR")) {
     g_hasClear = true;
+  } else if (!strcmp(buf, "CALIB")) {
+    g_hasCalib = true;
   } else if (!strncmp(buf, "RATE:", 5)) {
     g_pendingRate = (uint16_t)atoi(buf + 5);
     g_hasRate = true;
@@ -589,6 +640,9 @@ void loop() {
   uint8_t s12[12];
   float accG, gyrDps;
   if (readSample(s12, &accG, &gyrDps)) {
+    liveAx = (int16_t)(s12[0] | (s12[1] << 8));
+    liveAy = (int16_t)(s12[2] | (s12[3] << 8));
+    liveAz = (int16_t)(s12[4] | (s12[5] << 8));
     if (!recording) {
       memcpy(preBuf[preWrite], s12, SAMPLE_BYTES);
       preMagA[preWrite] = accG;
@@ -633,6 +687,22 @@ void loop() {
       p[4] = (uint8_t)qCount;
       txChar.notify(p, 5);
       lastStatusMs = nowMs;
+    }
+  }
+
+  // ---- Live idle readout (~20 Hz): latest accel for a live tilt + magnitude
+  // display. Idle-only (no recording, nothing queued) so throws take priority. ----
+  if (connected && !recording && qCount == 0 &&
+      connHdl != BLE_CONN_HANDLE_INVALID && txChar.notifyEnabled(connHdl)) {
+    uint32_t nowMs = millis();
+    if (nowMs - lastLiveMs >= 50) {
+      uint8_t p[7];
+      p[0] = PKT_LIVE;
+      memcpy(p + 1, &liveAx, 2);
+      memcpy(p + 3, &liveAy, 2);
+      memcpy(p + 5, &liveAz, 2);
+      txChar.notify(p, 7);
+      lastLiveMs = nowMs;
     }
   }
 }

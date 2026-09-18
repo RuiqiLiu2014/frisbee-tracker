@@ -142,8 +142,11 @@ class FrisbeeBle extends ChangeNotifier {
   StreamSubscription<List<int>>? _txSub;
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
-  Timer? _scanTimeout;
   Timer? _rssiTimer;
+  Timer? _btRetryTimer; // pending "wait for Bluetooth to come back" retry
+  bool _userStopped = false; // true after a manual Stop/Disconnect (no auto-rescan)
+  bool _reconnectPending = false; // a backoff-then-rescan is already scheduled
+  bool _disposed = false;
   Timer? _calibTimeout;
   Completer<CalibResult>? _calibCompleter;
 
@@ -160,64 +163,75 @@ class FrisbeeBle extends ChangeNotifier {
   // =========================================================================
   // Connection
   // =========================================================================
-  Future<void> startScanAndConnect() async {
-    if (_state == ConnState.scanning || _state == ConnState.connecting) return;
+  /// User taps "Start scan": begin (continuously) scanning for the disc.
+  Future<void> startScan() async {
+    if (_state == ConnState.scanning ||
+        _state == ConnState.connecting ||
+        _state == ConnState.connected) {
+      return;
+    }
+    _userStopped = false;
     _set(() {
       _state = ConnState.scanning;
       _status = "Scanning...";
     });
+    await _beginScan();
+  }
 
+  // (Re)start the actual BLE scan. Assumes the state is already `scanning`, so it
+  // works both for [startScan] and for the auto-reconnect backoff without
+  // tripping [startScan]'s guard.
+  Future<void> _beginScan() async {
+    if (_userStopped || _disposed) return;
     if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+      if (_userStopped || _disposed) {
+        _goIdle();
+        return;
+      }
+      // BT momentarily off (or a blip mid-reconnect): keep waiting and retry,
+      // staying in the scanning state so it recovers on its own once BT is back.
       _set(() {
-        _state = ConnState.disconnected;
-        _status = "Turn on Bluetooth!";
+        _state = ConnState.scanning;
+        _status = "Waiting for Bluetooth…";
+      });
+      _btRetryTimer?.cancel();
+      _btRetryTimer = Timer(const Duration(milliseconds: 1500), () {
+        if (!_userStopped && !_disposed) _beginScan();
       });
       return;
     }
+    if (_userStopped || _disposed) return;
 
-    // Subscribe BEFORE scanning so a result arriving during the scan isn't
-    // missed. One latch so the "found" and "timeout" paths can't both run.
-    bool resolved = false;
+    // One continuous scan (no timeout) until we find the disc or the user stops —
+    // repeatedly restarting short scans would hit Android's scan-rate throttle.
     await _scanSub?.cancel();
     _scanSub = FlutterBluePlus.scanResults.listen((results) async {
-      if (resolved) return;
+      if (_state != ConnState.scanning) return; // ignore once we move on
       for (final r in results) {
         if (r.device.platformName == kTargetDeviceName) {
-          resolved = true;
-          _scanTimeout?.cancel();
-          await _scanSub?.cancel();
-          _scanSub = null;
-          await FlutterBluePlus.stopScan();
-          await Future.delayed(const Duration(milliseconds: 400));
+          await _stopScanning();
+          if (_userStopped || _disposed) return;
           _connectToDevice(r.device);
           return;
         }
       }
     });
-
-    const scanWindow = Duration(seconds: 10);
-    _scanTimeout?.cancel();
-    _scanTimeout = Timer(scanWindow, () async {
-      if (resolved) return;
-      resolved = true;
-      await _scanSub?.cancel();
-      _scanSub = null;
-      await FlutterBluePlus.stopScan();
-      _set(() {
-        _state = ConnState.disconnected;
-        _status = "Could not find $kTargetDeviceName.";
-      });
-    });
-
     try {
-      await FlutterBluePlus.startScan(
-        timeout: scanWindow,
-        androidUsesFineLocation: true,
-      );
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      await FlutterBluePlus.startScan(androidUsesFineLocation: true);
     } catch (_) {
-      // startScan can throw if BLE is momentarily unavailable; the timeout
-      // timer surfaces the failure.
+      _reconnectOrIdle();
     }
+  }
+
+  Future<void> _stopScanning() async {
+    await _scanSub?.cancel();
+    _scanSub = null;
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
   }
 
   Future<void> _connectToDevice(BluetoothDevice device) async {
@@ -229,7 +243,7 @@ class FrisbeeBle extends ChangeNotifier {
       await device.disconnect();
     } catch (_) {}
 
-    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (int attempt = 1; attempt <= maxAttempts && !_userStopped; attempt++) {
       _set(() {
         _state = ConnState.connecting;
         _status = attempt == 1
@@ -255,11 +269,15 @@ class FrisbeeBle extends ChangeNotifier {
       }
     }
 
+    if (_userStopped || _disposed) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
+      _goIdle();
+      return;
+    }
     if (!connected) {
-      _set(() {
-        _state = ConnState.disconnected;
-        _status = "Could not connect. Try again.";
-      });
+      _reconnectOrIdle(); // couldn't link this time -> keep trying via the scan
       return;
     }
 
@@ -302,15 +320,10 @@ class FrisbeeBle extends ChangeNotifier {
           return;
         }
       }
-      _set(() {
-        _state = ConnState.disconnected;
-        _status = "UART service not found.";
-      });
+      // No UART service on this device -> treat like a failed connect, keep trying.
+      _reconnectOrIdle();
     } catch (_) {
-      _set(() {
-        _state = ConnState.disconnected;
-        _status = "Could not connect. Try again.";
-      });
+      _reconnectOrIdle();
     }
   }
 
@@ -571,30 +584,66 @@ class FrisbeeBle extends ChangeNotifier {
   // =========================================================================
   // Teardown
   // =========================================================================
+  /// User-initiated stop from ANY state (scanning, connecting, or connected):
+  /// tear everything down and stay idle — no auto-reconnect.
   Future<void> disconnect() async {
-    _scanTimeout?.cancel();
+    _userStopped = true;
+    _reconnectPending = false;
     _rssiTimer?.cancel();
+    _calibTimeout?.cancel();
     await _txSub?.cancel();
-    await _scanSub?.cancel();
-    try {
-      await FlutterBluePlus.stopScan();
-    } catch (_) {}
     await _connSub?.cancel();
+    _connSub = null;
     try {
       await _device?.disconnect();
     } catch (_) {}
-    _resetConnectionUi();
+    _goIdle(); // also stops any active scan
   }
 
+  // The GATT link dropped while we thought we were connected. If the user didn't
+  // ask to stop, treat it as the disc going out of range and auto-reconnect.
   void _handleDisconnected() {
     _txSub?.cancel();
     _connSub?.cancel();
+    _connSub = null;
     _rssiTimer?.cancel();
-    _resetConnectionUi();
+    _reconnectOrIdle();
   }
 
-  void _resetConnectionUi() {
+  // Resume scanning after an unexpected drop / failed connect, unless the user
+  // stopped. A short backoff avoids hammering the scanner; [_reconnectPending]
+  // collapses overlapping failures into a single rescan.
+  void _reconnectOrIdle() {
+    if (_userStopped || _disposed) {
+      _goIdle();
+      return;
+    }
+    if (_reconnectPending) return;
+    _reconnectPending = true;
     _resetAssembly();
+    _set(() {
+      _state = ConnState.scanning;
+      _status = "Reconnecting...";
+      _receiving = false;
+      _rssi = null;
+      _rxChar = null;
+      _liveAx = _liveAy = _liveAz = null;
+    });
+    Future.delayed(const Duration(milliseconds: 800), () {
+      _reconnectPending = false;
+      if (_userStopped || _disposed) {
+        _goIdle();
+        return;
+      }
+      _beginScan();
+    });
+  }
+
+  void _goIdle() {
+    _stopScanBestEffort();
+    _btRetryTimer?.cancel();
+    _resetAssembly();
+    _reconnectPending = false;
     _calibTimeout?.cancel();
     if (_calibCompleter != null && !_calibCompleter!.isCompleted) {
       _calibCompleter!.completeError(StateError("Disconnected"));
@@ -607,6 +656,12 @@ class FrisbeeBle extends ChangeNotifier {
       _rxChar = null;
       _liveAx = _liveAy = _liveAz = null;
     });
+  }
+
+  void _stopScanBestEffort() {
+    _scanSub?.cancel();
+    _scanSub = null;
+    FlutterBluePlus.stopScan().then((_) {}, onError: (_) {});
   }
 
   // =========================================================================
@@ -662,8 +717,9 @@ class FrisbeeBle extends ChangeNotifier {
 
   @override
   void dispose() {
-    _scanTimeout?.cancel();
+    _disposed = true;
     _rssiTimer?.cancel();
+    _btRetryTimer?.cancel();
     _calibTimeout?.cancel();
     _txSub?.cancel();
     _scanSub?.cancel();
