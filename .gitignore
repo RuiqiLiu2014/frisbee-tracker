@@ -2,3 +2,4 @@
 # Working copies stay on disk; they are just not tracked/pushed.
 TODO.md
 test_plan.md
+data/
