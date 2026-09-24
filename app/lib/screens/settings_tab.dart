@@ -5,6 +5,7 @@ import '../constants.dart';
 import '../services/frisbee_ble.dart';
 import '../settings.dart';
 import '../theme.dart';
+import '../widgets/interactive_chart.dart';
 
 /// Settings tab. The Appearance + Theme section is a direct port of the
 /// PingPongTracker settings page (same themes, order, and widget sizes), wired
@@ -28,6 +29,26 @@ class SettingsTab extends StatelessWidget {
   Future<void> _saveInt(String key, int value) async {
     final p = await SharedPreferences.getInstance();
     await p.setInt(key, value);
+  }
+
+  // One checklist row (leading checkbox + graph name) in "Graphs to display",
+  // matching the ping-pong tracker's `_graphToggle`.
+  Widget _graphCheck(String name, ValueNotifier<bool> notifier, String prefKey) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: notifier,
+      builder: (context, v, _) => CheckboxListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        controlAffinity: ListTileControlAffinity.leading,
+        title: Text(name, style: const TextStyle(fontSize: 15)),
+        value: v,
+        onChanged: (nv) {
+          final val = nv ?? false;
+          notifier.value = val;
+          _saveBool(prefKey, val);
+        },
+      ),
+    );
   }
 
   String _fmtBytes(int b) {
@@ -167,34 +188,93 @@ class SettingsTab extends StatelessWidget {
           ],
         ),
         const Divider(height: 24),
+        // Per-log chart checklist (mirrors the ping-pong tracker's "Graphs to
+        // display": leading-checkbox rows rather than toggles).
         const Text(
-          "Graphs",
+          "Graphs to display",
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
         ),
+        const SizedBox(height: 4),
+        _graphCheck("Raw acceleration", showAccelNotifier, kShowAccelKey),
+        _graphCheck("Raw gyroscope", showGyroNotifier, kShowGyroKey),
+        const Divider(height: 24),
+        // Throws-list + graph-hover behavior (ported from the ping-pong tracker).
         ValueListenableBuilder<bool>(
-          valueListenable: showAccelNotifier,
+          valueListenable: alwaysShowLogsNotifier,
           builder: (context, v, _) => SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text("Show accelerometer graph"),
-            subtitle: const Text("The raw accelerometer (g) trace in each throw."),
+            title: const Text(
+              "Always show logs list",
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            subtitle: const Text(
+              "Returning to the Throws tab shows the full list instead of the "
+              "last-opened throw.",
+            ),
             value: v,
             onChanged: (nv) {
-              showAccelNotifier.value = nv;
-              _saveBool(kShowAccelKey, nv);
+              alwaysShowLogsNotifier.value = nv;
+              _saveBool(kResetLogsKey, nv);
             },
           ),
         ),
+        const Divider(height: 24),
         ValueListenableBuilder<bool>(
-          valueListenable: showGyroNotifier,
+          valueListenable: hoverPersistsNotifier,
           builder: (context, v, _) => SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text("Show gyroscope graph"),
-            subtitle: const Text("The raw gyroscope (dps) trace in each throw."),
+            title: const Text(
+              "Persist graph hover",
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            subtitle: const Text(
+              "Keep the value readout on the graph after you lift your finger.",
+            ),
             value: v,
             onChanged: (nv) {
-              showGyroNotifier.value = nv;
-              _saveBool(kShowGyroKey, nv);
+              hoverPersistsNotifier.value = nv;
+              _saveBool(kHoverPersistKey, nv);
             },
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Text(
+          "Hover readout position",
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          "Where the value box sits when you hover a graph.",
+          style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 8),
+        ValueListenableBuilder<HoverReadoutPos>(
+          valueListenable: hoverPosNotifier,
+          builder: (context, pos, _) => SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: SegmentedButton<HoverReadoutPos>(
+              showSelectedIcon: false,
+              segments: const [
+                ButtonSegment(
+                  value: HoverReadoutPos.follow,
+                  label: Text("Follow"),
+                ),
+                ButtonSegment(value: HoverReadoutPos.left, label: Text("Left")),
+                ButtonSegment(
+                  value: HoverReadoutPos.right,
+                  label: Text("Right"),
+                ),
+                ButtonSegment(
+                  value: HoverReadoutPos.adaptive,
+                  label: Text("Adaptive"),
+                ),
+              ],
+              selected: {pos},
+              onSelectionChanged: (s) {
+                hoverPosNotifier.value = s.first;
+                _saveString(kHoverPosKey, s.first.name);
+              },
+            ),
           ),
         ),
         const Divider(height: 24),

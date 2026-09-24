@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'constants.dart';
 import 'settings.dart';
 import 'theme.dart';
+import 'widgets/interactive_chart.dart';
 import 'screens/home_shell.dart';
 
 Future<void> main() async {
@@ -17,6 +18,15 @@ Future<void> main() async {
   showAccelNotifier.value = prefs.getBool(kShowAccelKey) ?? true;
   showGyroNotifier.value = prefs.getBool(kShowGyroKey) ?? true;
   preRollMsNotifier.value = prefs.getInt(kPreRollKey) ?? kDefaultPreRollMs;
+  alwaysShowLogsNotifier.value = prefs.getBool(kResetLogsKey) ?? true;
+  hoverPersistsNotifier.value = prefs.getBool(kHoverPersistKey) ?? false;
+  final hoverPosStr = prefs.getString(kHoverPosKey);
+  if (hoverPosStr != null) {
+    hoverPosNotifier.value = HoverReadoutPos.values.firstWhere(
+      (e) => e.name == hoverPosStr,
+      orElse: () => HoverReadoutPos.follow,
+    );
+  }
   runApp(const FrisbeeTrackerApp());
 }
 

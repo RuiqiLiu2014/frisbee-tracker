@@ -44,6 +44,7 @@ class _HomeShellState extends State<HomeShell>
   void initState() {
     super.initState();
     _tab = TabController(length: 3, vsync: this);
+    _tab.addListener(_onTabChanged);
     _ble.addListener(_onBleChanged);
     _throwSub = _ble.throws.listen(_onThrowReceived);
     _loadLogs();
@@ -124,18 +125,42 @@ class _HomeShellState extends State<HomeShell>
     if (mounted) setState(() {});
   }
 
+  // When "Always show logs list" is on, leaving the Throws tab (index 1) clears
+  // the open throw so returning shows the full list. Always rebuilds so the
+  // detail view re-reads the hover settings and PopScope tracks the tab. Mirrors
+  // the ping-pong tracker.
+  void _onTabChanged() {
+    if (alwaysShowLogsNotifier.value && _tab.index != 1 && _openLog != null) {
+      _openLog = null;
+    }
+    if (mounted) setState(() {});
+  }
+
   Future<void> _loadLogs() async {
     final res = await _repo.loadAll();
     final prefs = await SharedPreferences.getInstance();
     final persistedSeq = prefs.getInt(kLogSeqKey) ?? 0;
+    // Numbering (mirrors the ping-pong tracker): restart at 1 when no logs remain,
+    // otherwise continue from the last issued number (persisted, so deleting the
+    // newest doesn't reuse it).
+    final nextBase = res.logs.isEmpty ? 0 : math.max(persistedSeq, res.maxId);
+    await prefs.setInt(kLogSeqKey, nextBase);
     if (!mounted) return;
     setState(() {
       _logs
         ..clear()
         ..addAll(res.logs);
-      _logSeq = math.max(persistedSeq, res.maxId);
+      _logSeq = nextBase;
     });
     _refreshStorage();
+  }
+
+  // Once the log list becomes empty, restart numbering at 1 for the next capture
+  // (persisted). Mirrors the ping-pong tracker.
+  Future<void> _resetLogNumbering() async {
+    _logSeq = 0;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(kLogSeqKey, 0);
   }
 
   Future<void> _onThrowReceived(ReceivedThrow r) async {
@@ -183,6 +208,7 @@ class _HomeShellState extends State<HomeShell>
       _logs.removeWhere((l) => l.id == log.id);
       if (_openLog?.id == log.id) _openLog = null;
     });
+    if (_logs.isEmpty) await _resetLogNumbering(); // deleting the last -> next is 1
     _refreshStorage();
   }
 
@@ -242,6 +268,7 @@ class _HomeShellState extends State<HomeShell>
       _logs.clear();
       _openLog = null;
     });
+    await _resetLogNumbering(); // empty -> next capture restarts at 1
     _refreshStorage();
   }
 
@@ -827,8 +854,8 @@ class _HomeShellState extends State<HomeShell>
             cornerText: null,
             centerZero: true,
             markerTimes: const [],
-            persist: false,
-            pos: HoverReadoutPos.follow,
+            persist: hoverPersistsNotifier.value,
+            pos: hoverPosNotifier.value,
             timeLabel: (s) => "${(s * 1000).toStringAsFixed(0)} ms",
             dark: dark,
           ),
